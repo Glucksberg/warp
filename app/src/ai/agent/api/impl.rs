@@ -14,6 +14,14 @@ pub async fn generate_multi_agent_output(
     mut params: RequestParams,
     cancellation_rx: futures::channel::oneshot::Receiver<()>,
 ) -> Result<ResponseStream, ConvertToAPITypeError> {
+    if params.should_redact_secrets {
+        redaction::redact_inputs(&mut params.input);
+    }
+
+    if super::pi_local::is_enabled() {
+        return Ok(super::pi_local::generate_multi_agent_output(params, cancellation_rx).await);
+    }
+
     let supported_tools = params
         .supported_tools_override
         .take()
@@ -45,10 +53,6 @@ pub async fn generate_multi_agent_output(
                 )),
             },
         );
-    }
-
-    if params.should_redact_secrets {
-        redaction::redact_inputs(&mut params.input);
     }
 
     let api_keys = api_keys_with_warp_credit_fallback_setting(

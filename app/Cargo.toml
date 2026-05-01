@@ -64,6 +64,7 @@ async-broadcast.workspace = true
 async-channel.workspace = true
 async-compat.workspace = true
 async-fs.workspace = true
+async-process.workspace = true
 async-recursion.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
@@ -388,7 +389,6 @@ winreg.workspace = true
 
 [dev-dependencies]
 ai = { workspace = true, features = ["test-util"] }
-async-process.workspace = true
 jsonschema = { workspace = true, default-features = false }
 async-executor = "1.5.1"
 command = { workspace = true, features = ["test-util"] }

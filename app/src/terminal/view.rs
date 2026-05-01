@@ -26400,7 +26400,13 @@ impl View for TerminalView {
                             ),
                         )
                     } else {
-                        self.render_block_list_element(&model, input_mode, true, app)
+                        let element = self.render_block_list_element(&model, input_mode, true, app);
+                        if self.has_active_cli_agent_input_session(app) {
+                            did_wrap_terminal_size = true;
+                            wrap_in_terminal_size_element(&self.resize_tx, element)
+                        } else {
+                            element
+                        }
                     };
 
                     column.add_child(Shrinkable::new(1., output_area).finish());

@@ -100,7 +100,7 @@ impl AuthState {
     }
 
     /// Creates and initializes auth state. Checks, in order:
-    /// 1. Test user (test/integration/skip_login builds)
+    /// 1. Local test user (test/integration/skip_login/OSS builds)
     /// 2. Provided API key
     /// 3. WARP_USER_SECRET environment variable
     /// 4. Persisted user from secure storage
@@ -110,7 +110,6 @@ impl AuthState {
 
         if Self::should_use_test_user() {
             state.set_user(Some(User::test()));
-            #[cfg(any(test, feature = "integration_tests", feature = "skip_login"))]
             state.set_credentials(Some(Credentials::Test));
             return state;
         }
@@ -160,7 +159,8 @@ impl AuthState {
     }
 
     fn should_use_test_user() -> bool {
-        cfg!(any(test, feature = "skip_login")) || ChannelState::channel() == Channel::Integration
+        cfg!(any(test, feature = "skip_login"))
+            || matches!(ChannelState::channel(), Channel::Integration | Channel::Oss)
     }
 
     /// Determines the appropriate persistence action based on the current auth state.
@@ -195,7 +195,6 @@ impl AuthState {
             (Some(_), Some(Credentials::ApiKey { .. })) => PersistAction::DoNothing,
             (Some(_), Some(Credentials::Bearer(_))) => PersistAction::DoNothing,
             (Some(_), Some(Credentials::SessionCookie)) => PersistAction::DoNothing,
-            #[cfg(any(test, feature = "integration_tests", feature = "skip_login"))]
             (Some(_), Some(Credentials::Test)) => PersistAction::DoNothing,
             // Credentials without a user, or user without credentials - transient states
             // during initialization or refresh; no persistence action needed.
