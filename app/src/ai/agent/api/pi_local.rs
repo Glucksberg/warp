@@ -26,6 +26,7 @@ const PI_MODEL_ENV: &str = "WARP_PI_MODEL";
 const PI_THINKING_ENV: &str = "WARP_PI_THINKING";
 const PI_TOOLS_ENV: &str = "WARP_PI_TOOLS";
 const PI_DISABLE_TOOL_GATE_ENV: &str = "WARP_PI_DISABLE_TOOL_GATE";
+const PI_DISABLE_ACTION_PROXY_ENV: &str = "WARP_PI_DISABLE_ACTION_PROXY";
 const PI_SESSION_DIR_ENV: &str = "WARP_PI_SESSION_DIR";
 const LOCAL_CONVERSATION_PREFIX: &str = "pi-local-";
 const DEFAULT_PI_PROVIDER: &str = "openai-codex";
@@ -221,9 +222,9 @@ pub async fn generate_multi_agent_output(
             }
         }
 
-        if !stream_state.has_assistant_output() {
+        if !stream_state.has_stream_output() {
             yield Err(Arc::new(AIApiError::Other(anyhow!(
-                "Pi runtime completed without assistant output. Check Pi authentication, selected model, and local Pi logs."
+                "Pi runtime completed without assistant output or Warp action output. Check Pi authentication, selected model, and local Pi logs."
             ))));
             let _ = child.kill();
             return;
@@ -803,6 +804,7 @@ struct PiStreamState {
     assistant_message_started: bool,
     tool_message_started: bool,
     assistant_output_seen: bool,
+    warp_action_output_seen: bool,
 }
 
 impl PiStreamState {
@@ -815,11 +817,16 @@ impl PiStreamState {
             assistant_message_started: false,
             tool_message_started: false,
             assistant_output_seen: false,
+            warp_action_output_seen: false,
         }
     }
 
     fn has_assistant_output(&self) -> bool {
         self.assistant_output_seen
+    }
+
+    fn has_stream_output(&self) -> bool {
+        self.assistant_output_seen || self.warp_action_output_seen
     }
 
     fn push_assistant_delta(&mut self, text: &str) -> Vec<api::ResponseEvent> {
@@ -864,6 +871,21 @@ impl PiStreamState {
                 format!("Pi tool activity:\n{line}"),
             )]
         }
+    }
+
+    fn push_warp_bash_action(
+        &mut self,
+        tool_call_id: String,
+        command: String,
+    ) -> Vec<api::ResponseEvent> {
+        self.warp_action_output_seen = true;
+        vec![add_bash_tool_call_event(
+            self.task_id.clone(),
+            self.request_id.clone(),
+            format!("pi-warp-action-message-{}", Uuid::new_v4()),
+            tool_call_id,
+            command,
+        )]
     }
 }
 
@@ -1050,6 +1072,10 @@ fn handle_pi_event(event: &Value, state: &mut PiStreamState) -> anyhow::Result<P
             Ok(PiEventAction::Finish(events))
         }
         Some("tool_execution_start") => {
+            if let Some(events) = proxy_bash_tool_call_to_warp(event, state) {
+                return Ok(PiEventAction::Finish(events));
+            }
+
             let event = PiToolEvent {
                 tool_call_id: event_string(event, "toolCallId").unwrap_or_else(|| "unknown".into()),
                 tool_name: event_string(event, "toolName").unwrap_or_else(|| "tool".into()),
@@ -1091,6 +1117,29 @@ fn handle_pi_event(event: &Value, state: &mut PiStreamState) -> anyhow::Result<P
         )),
         _ => Ok(PiEventAction::Continue(Vec::new())),
     }
+}
+
+fn proxy_bash_tool_call_to_warp(
+    event: &Value,
+    state: &mut PiStreamState,
+) -> Option<Vec<api::ResponseEvent>> {
+    if env_flag_is_enabled(PI_DISABLE_ACTION_PROXY_ENV)
+        || env_flag_is_enabled("WARP_PI_ALLOW_UNBRIDGED_MUTATING_TOOLS")
+        || event.get("toolName").and_then(Value::as_str) != Some("bash")
+    {
+        return None;
+    }
+
+    let tool_call_id = event_string(event, "toolCallId")
+        .unwrap_or_else(|| format!("pi-bash-action-{}", Uuid::new_v4()));
+    let command = event
+        .get("args")
+        .and_then(|args| args.get("command"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|command| !command.trim().is_empty())?;
+
+    Some(state.push_warp_bash_action(tool_call_id, command))
 }
 
 fn event_string(event: &Value, key: &str) -> Option<String> {
@@ -1246,6 +1295,56 @@ fn append_agent_output_event(
     }
 }
 
+fn add_bash_tool_call_event(
+    task_id: String,
+    request_id: String,
+    message_id: String,
+    tool_call_id: String,
+    command: String,
+) -> api::ResponseEvent {
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::AddMessagesToTask(
+                        api::client_action::AddMessagesToTask {
+                            task_id: task_id.clone(),
+                            messages: vec![api::Message {
+                                id: message_id,
+                                task_id,
+                                server_message_data: String::new(),
+                                citations: vec![],
+                                message: Some(api::message::Message::ToolCall(
+                                    api::message::ToolCall {
+                                        tool_call_id,
+                                        tool: Some(
+                                            api::message::tool_call::Tool::RunShellCommand(
+                                                api::message::tool_call::RunShellCommand {
+                                                    command,
+                                                    is_read_only: false,
+                                                    uses_pager: false,
+                                                    citations: vec![],
+                                                    is_risky: true,
+                                                    risk_category: api::RiskCategory::Risky as i32,
+                                                    wait_until_complete_value: Some(
+                                                        api::message::tool_call::run_shell_command::WaitUntilCompleteValue::WaitUntilComplete(true),
+                                                    ),
+                                                },
+                                            ),
+                                        ),
+                                    },
+                                )),
+                                request_id,
+                                timestamp: None,
+                            }],
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
 fn create_root_task_event(task_id: String) -> api::ResponseEvent {
     api::ResponseEvent {
         r#type: Some(api::response_event::Type::ClientActions(
@@ -1303,9 +1402,10 @@ mod tests {
     use warp_core::command::ExitCode;
 
     use super::{
-        append_agent_output_event, handle_extension_ui_request, handle_pi_event,
-        is_pi_local_conversation_token, plain_prompt_from_input, prompt_from_input,
-        sanitize_session_file_stem, validate_prompt_input, PiEventAction, PiStreamState,
+        add_bash_tool_call_event, append_agent_output_event, handle_extension_ui_request,
+        handle_pi_event, is_pi_local_conversation_token, plain_prompt_from_input,
+        prompt_from_input, sanitize_session_file_stem, validate_prompt_input, PiEventAction,
+        PiStreamState,
     };
     use crate::ai::agent::api::ServerConversationToken;
 
@@ -1335,6 +1435,21 @@ mod tests {
             return None;
         };
         Some(&output.text)
+    }
+
+    fn event_tool_call(event: &api::ResponseEvent) -> Option<&api::message::ToolCall> {
+        let api::response_event::Type::ClientActions(actions) = event.r#type.as_ref()? else {
+            return None;
+        };
+        let action = actions.actions.first()?.action.as_ref()?;
+        let api::client_action::Action::AddMessagesToTask(add) = action else {
+            return None;
+        };
+        let message = add.messages.first()?;
+        let api::message::Message::ToolCall(tool_call) = message.message.as_ref()? else {
+            return None;
+        };
+        Some(tool_call)
     }
 
     fn agent_output_message(id: &str, text: &str) -> api::Message {
@@ -1573,6 +1688,55 @@ mod tests {
         assert_eq!(events.len(), 1);
         let text = event_agent_output_text(&events[0]).unwrap();
         assert!(text.contains("completed read (call_1): file contents"));
+    }
+
+    #[test]
+    fn pi_bash_tool_start_is_proxied_to_native_warp_action() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+
+        let action = handle_pi_event(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_bash",
+                "toolName": "bash",
+                "args": { "command": "cargo test" }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let PiEventAction::Finish(events) = action else {
+            panic!("expected stream finish for proxied bash");
+        };
+
+        assert!(state.has_stream_output());
+        let tool_call = event_tool_call(&events[0]).unwrap();
+        assert_eq!(tool_call.tool_call_id, "call_bash");
+        let Some(api::message::tool_call::Tool::RunShellCommand(command)) = tool_call.tool.as_ref()
+        else {
+            panic!("expected RunShellCommand tool call");
+        };
+        assert_eq!(command.command, "cargo test");
+        assert!(command.is_risky);
+        assert_eq!(command.risk_category, api::RiskCategory::Risky as i32);
+    }
+
+    #[test]
+    fn add_bash_tool_call_event_uses_warp_tool_call_message() {
+        let event = add_bash_tool_call_event(
+            "task".to_string(),
+            "request".to_string(),
+            "message".to_string(),
+            "call".to_string(),
+            "echo hi".to_string(),
+        );
+
+        let tool_call = event_tool_call(&event).unwrap();
+        let Some(api::message::tool_call::Tool::RunShellCommand(command)) = tool_call.tool.as_ref()
+        else {
+            panic!("expected RunShellCommand tool call");
+        };
+        assert_eq!(tool_call.tool_call_id, "call");
+        assert_eq!(command.command, "echo hi");
     }
 
     #[test]

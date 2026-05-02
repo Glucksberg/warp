@@ -13,6 +13,10 @@ export default function warpToolGate(pi: ExtensionAPI) {
 			return;
 		}
 
+		if (event.toolName === "bash" && !isEnabled(process.env.WARP_PI_DISABLE_ACTION_PROXY)) {
+			return;
+		}
+
 		if (MUTATING_TOOLS.has(event.toolName) && isEnabled(process.env.WARP_PI_ALLOW_UNBRIDGED_MUTATING_TOOLS)) {
 			return;
 		}
