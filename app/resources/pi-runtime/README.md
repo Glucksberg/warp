@@ -86,16 +86,32 @@ text deltas into the existing Warp agent conversation UI, and uses Pi's session
 file support to preserve conversation history across normal follow-up prompts in
 the same local Warp conversation.
 
-The prompt sent to Pi includes a small safe context block for current directory,
-home directory, execution environment, current time, indexed codebase, git head,
-branch, and available skill names/descriptions when Warp provides them.
+The prompt sent to Pi includes Warp context for current directory, home
+directory, execution environment, current time, indexed codebase, git head,
+branch, selected text, selected terminal blocks, file/project-rule context,
+running command snapshots, images as metadata, text/document/diff attachments,
+and available skill names/descriptions when Warp provides them.
 
 The adapter mirrors Pi tool lifecycle events into a compact streamed "Pi tool
 activity" message. This exposes which local tools ran without asking Warp to
-execute the same tool call a second time.
+execute the same tool call a second time. Native Warp tool-call cards are not
+emitted for Pi-executed tools yet because Warp treats tool-call messages as
+actions to queue after the stream finishes; emitting them only for display would
+double-run the tool.
 
-Resumed/forked server conversations, action-result continuations, native Warp
-tool approval/execution for mutating tools, file diffs, and extension UI
-requests are intentionally left for the next integration layer. Until that
-richer bridge exists, the adapter rejects context-dependent requests instead of
-sending an incomplete prompt to Pi.
+Warp `ActionResult` continuations are converted back into a Pi prompt frame in
+the same `pi-local-*` session. This is the first half of the native action
+bridge: once a future controller layer emits a Warp action and finishes the
+stream, the resulting action output can be fed back to Pi as the next frame.
+
+Pi extension UI requests are handled in RPC mode. Fire-and-forget requests such
+as notifications/status updates are mirrored into the tool activity stream.
+Blocking dialog requests (`select`, `confirm`, `input`, `editor`) receive a
+safe cancellation response so extensions cannot deadlock the local runtime until
+Warp has a real dialog bridge.
+
+Resumed/forked server conversations, native Warp tool approval/execution for
+mutating Pi tools, and first-class extension dialogs are intentionally left for
+the next controller/action-model integration layer. Until that richer bridge
+exists, mutating Pi tools remain blocked by `warp-tool-gate.ts` unless explicitly
+enabled for raw Pi testing.

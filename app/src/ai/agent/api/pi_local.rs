@@ -11,7 +11,9 @@ use serde_json::Value;
 use uuid::Uuid;
 use warp_multi_agent_api as api;
 
-use crate::ai::agent::{AIAgentContext, AIAgentInput, UserQueryMode};
+use crate::ai::agent::{
+    AIAgentAttachment, AIAgentContext, AIAgentInput, AnyFileContent, RunningCommand, UserQueryMode,
+};
 use crate::server::server_api::AIApiError;
 
 use super::{RequestParams, ResponseStream, ServerConversationToken};
@@ -177,6 +179,20 @@ pub async fn generate_multi_agent_output(
                             return;
                         }
                     };
+
+                    if let Some((response, events)) = handle_extension_ui_request(&event, &mut stream_state) {
+                        for event in events {
+                            yield Ok(event);
+                        }
+                        if let Some(response) = response {
+                            if let Err(err) = write_pi_prompt(&mut stdin, &response).await {
+                                yield Err(Arc::new(AIApiError::Other(err)));
+                                let _ = child.kill();
+                                return;
+                            }
+                        }
+                        continue;
+                    }
 
                     match handle_pi_event(&event, &mut stream_state) {
                         Ok(PiEventAction::Continue(events)) => {
@@ -402,13 +418,13 @@ fn validate_one_shot_request(params: &RequestParams) -> anyhow::Result<()> {
         || params.input.len() != 1
     {
         return Err(anyhow!(
-            "Pi local runtime currently supports only direct prompt submissions in pi-local \
-conversations. Forked server conversations and action-result continuations require a richer \
-session bridge before they can be routed safely."
+            "Pi local runtime supports only pi-local conversations with one input frame per \
+request. Forked server conversations require a conversation-history bridge before they can be \
+routed safely."
         ));
     }
 
-    validate_plain_prompt_input(params.input.first().expect("checked input length above"))
+    validate_prompt_input(params.input.first().expect("checked input length above"))
 }
 
 fn is_pi_local_conversation_token(token: &ServerConversationToken) -> bool {
@@ -420,23 +436,52 @@ fn prompt_from_params(params: &RequestParams) -> Option<String> {
 }
 
 fn prompt_from_input(input: &AIAgentInput) -> Option<String> {
-    let AIAgentInput::UserQuery { query, context, .. } = input else {
-        return None;
+    let mut context_lines = Vec::new();
+    let body = match input {
+        AIAgentInput::UserQuery {
+            query,
+            context,
+            static_query_type,
+            referenced_attachments,
+            user_query_mode,
+            running_command,
+            ..
+        } => {
+            for context in context.iter() {
+                add_context_lines(context, &mut context_lines);
+            }
+            if let Some(static_query_type) = static_query_type {
+                context_lines.push(format!("Warp entrypoint query type: {static_query_type:?}"));
+            }
+            if !matches!(user_query_mode, UserQueryMode::Normal) {
+                context_lines.push(format!("Warp query mode: {user_query_mode:?}"));
+            }
+            if let Some(running_command) = running_command {
+                add_running_command_lines(running_command, &mut context_lines);
+            }
+            add_attachment_lines(referenced_attachments, &mut context_lines);
+            query.clone()
+        }
+        AIAgentInput::ActionResult { result, context } => {
+            for context in context.iter() {
+                add_context_lines(context, &mut context_lines);
+            }
+            format!(
+                "<warp_action_result id=\"{}\" task_id=\"{}\">\n{}\n</warp_action_result>\n\nContinue from the Warp action result above.",
+                result.id, result.task_id, result
+            )
+        }
+        _ => return None,
     };
 
-    let mut context_lines = Vec::new();
-    for context in context.iter() {
-        add_context_lines(context, &mut context_lines);
-    }
-
     if context_lines.is_empty() {
-        return Some(query.clone());
+        return Some(body);
     }
 
     Some(format!(
         "<warp_context>\n{}\n</warp_context>\n\n{}",
         context_lines.join("\n"),
-        query
+        body
     ))
 }
 
@@ -479,8 +524,53 @@ fn add_context_lines(context: &AIAgentContext, lines: &mut Vec<String>) {
         AIAgentContext::CurrentTime { current_time } => {
             lines.push(format!("Current time: {}", current_time.to_rfc3339()));
         }
+        AIAgentContext::SelectedText(text) => {
+            lines.push(format!(
+                "Selected text:\n```text\n{}\n```",
+                truncate_preview(text, 8_000)
+            ));
+        }
+        AIAgentContext::Image(image) => {
+            lines.push(format!(
+                "Attached image: file_name={}, mime_type={}, figma={}",
+                image.file_name, image.mime_type, image.is_figma
+            ));
+        }
         AIAgentContext::Codebase { path, name } => {
             lines.push(format!("Codebase: {name} ({path})"));
+        }
+        AIAgentContext::ProjectRules {
+            root_path,
+            active_rules,
+            additional_rule_paths,
+        } => {
+            lines.push(format!("Project rules root: {root_path}"));
+            for rule in active_rules.iter().take(20) {
+                let content = file_context_content_preview(rule, 4_000);
+                lines.push(format!(
+                    "Active project rule: {}{}",
+                    rule,
+                    content
+                        .map(|content| format!("\n```text\n{content}\n```"))
+                        .unwrap_or_default()
+                ));
+            }
+            if !additional_rule_paths.is_empty() {
+                lines.push(format!(
+                    "Additional project rule paths: {}",
+                    additional_rule_paths.join(", ")
+                ));
+            }
+        }
+        AIAgentContext::File(file) => {
+            let content = file_context_content_preview(file, 8_000);
+            lines.push(format!(
+                "Relevant file: {}{}",
+                file,
+                content
+                    .map(|content| format!("\n```text\n{content}\n```"))
+                    .unwrap_or_default()
+            ));
         }
         AIAgentContext::Git { head, branch } => {
             let branch = branch.as_deref().unwrap_or("unknown");
@@ -512,46 +602,181 @@ fn add_context_lines(context: &AIAgentContext, lines: &mut Vec<String>) {
                 suffix
             ));
         }
-        _ => {}
+        AIAgentContext::Block(block) => {
+            lines.push(format!(
+                "Terminal block: command=`{}` exit_code={}{}{}{}{}{}\n```text\n{}\n```",
+                block.command,
+                block.exit_code.value(),
+                block
+                    .pwd
+                    .as_ref()
+                    .map(|pwd| format!(", cwd={pwd}"))
+                    .unwrap_or_default(),
+                block
+                    .shell
+                    .as_ref()
+                    .map(|shell| format!(", shell={shell}"))
+                    .unwrap_or_default(),
+                block
+                    .git_branch
+                    .as_ref()
+                    .map(|branch| format!(", git_branch={branch}"))
+                    .unwrap_or_default(),
+                block
+                    .started_ts
+                    .as_ref()
+                    .map(|ts| format!(", started={}", ts.to_rfc3339()))
+                    .unwrap_or_default(),
+                block
+                    .finished_ts
+                    .as_ref()
+                    .map(|ts| format!(", finished={}", ts.to_rfc3339()))
+                    .unwrap_or_default(),
+                truncate_preview(&block.output, 12_000)
+            ));
+        }
     }
 }
 
-fn validate_plain_prompt_input(input: &AIAgentInput) -> anyhow::Result<()> {
+fn file_context_content_preview(
+    file: &crate::ai::agent::FileContext,
+    max_chars: usize,
+) -> Option<String> {
+    match &file.content {
+        AnyFileContent::StringContent(content) if !content.trim().is_empty() => {
+            Some(truncate_preview(content, max_chars))
+        }
+        AnyFileContent::BinaryContent(content) if !content.is_empty() => Some(format!(
+            "<binary content: {} bytes, {} total lines>",
+            content.len(),
+            file.line_count
+        )),
+        _ => None,
+    }
+}
+
+fn add_attachment_lines(
+    attachments: &std::collections::HashMap<String, AIAgentAttachment>,
+    lines: &mut Vec<String>,
+) {
+    for (name, attachment) in attachments.iter() {
+        match attachment {
+            AIAgentAttachment::PlainText(text) => {
+                lines.push(format!(
+                    "Attachment {name}:\n```text\n{}\n```",
+                    truncate_preview(text, 12_000)
+                ));
+            }
+            AIAgentAttachment::DocumentContent {
+                document_id,
+                content,
+                source,
+                line_range,
+            } => {
+                lines.push(format!(
+                    "Document attachment {name}: id={document_id}, source={source:?}, line_range={line_range:?}\n```text\n{}\n```",
+                    truncate_preview(content, 12_000)
+                ));
+            }
+            AIAgentAttachment::DiffHunk {
+                file_path,
+                diff_content,
+                lines_added,
+                lines_removed,
+                ..
+            } => {
+                lines.push(format!(
+                    "Diff attachment {name}: file={file_path}, +{lines_added}/-{lines_removed}\n```diff\n{}\n```",
+                    truncate_preview(diff_content, 12_000)
+                ));
+            }
+            AIAgentAttachment::DiffSet { file_diffs, .. } => {
+                lines.push(format!(
+                    "Diff set attachment {name}: files={}",
+                    file_diffs.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            AIAgentAttachment::FilePathReference {
+                file_name,
+                file_path,
+                ..
+            } => {
+                lines.push(format!(
+                    "File path attachment {name}: file_name={file_name}, path={file_path}"
+                ));
+            }
+            AIAgentAttachment::DriveObject { uid, payload } => {
+                lines.push(format!(
+                    "Drive object attachment {name}: uid={uid}, payload={}",
+                    payload
+                        .as_ref()
+                        .and_then(|payload| serde_json::to_string(payload).ok())
+                        .map(|payload| truncate_preview(&payload, 4_000))
+                        .unwrap_or_else(|| "<none>".to_string())
+                ));
+            }
+            AIAgentAttachment::Block(block) => {
+                lines.push(format!(
+                    "Block attachment {name}: command=`{}` exit_code={}\n```text\n{}\n```",
+                    block.command,
+                    block.exit_code.value(),
+                    truncate_preview(&block.output, 12_000)
+                ));
+            }
+        }
+    }
+}
+
+fn add_running_command_lines(command: &RunningCommand, lines: &mut Vec<String>) {
+    lines.push(format!(
+        "Running command: command=`{}`, block_id={}, alt_screen={}, requested_action_id={}",
+        command.command,
+        command.block_id,
+        command.is_alt_screen_active,
+        command
+            .requested_command_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "<none>".to_string())
+    ));
+    if !command.grid_contents.trim().is_empty() {
+        lines.push(format!(
+            "Running command terminal contents:\n```text\n{}\n```",
+            truncate_preview(&command.grid_contents, 12_000)
+        ));
+    }
+    if !command.cursor.trim().is_empty() {
+        lines.push(format!(
+            "Running command cursor context:\n```text\n{}\n```",
+            truncate_preview(&command.cursor, 2_000)
+        ));
+    }
+}
+
+fn validate_prompt_input(input: &AIAgentInput) -> anyhow::Result<()> {
     match input {
         AIAgentInput::UserQuery {
             query,
-            context,
-            static_query_type,
-            referenced_attachments,
-            user_query_mode,
-            running_command,
             intended_agent,
+            ..
         } => {
             if query.trim().is_empty() {
                 return Err(anyhow!("Pi local runtime requires a user prompt."));
             }
 
-            if !context.iter().all(is_ignorable_base_context)
-                || !referenced_attachments.is_empty()
-                || running_command.is_some()
-                || static_query_type.is_some()
-                || matches!(intended_agent, Some(api::AgentType::Cli))
-                || !matches!(user_query_mode, UserQueryMode::Normal)
-            {
+            if matches!(intended_agent, Some(api::AgentType::Cli)) {
                 return Err(anyhow!(
-                    "Pi local runtime currently supports only plain text Agent Mode prompts. \
-Prompts with selected blocks, file/project-rule context, attachments, images, running command \
-context, CLI-agent routing, or mode-specific behavior require a context bridge before they can \
-be routed safely."
+                    "Pi local runtime handles Warp Agent Mode prompts. CLI-agent routing still \
+belongs to the terminal-native CLI integration."
                 ));
             }
 
             Ok(())
         }
+        AIAgentInput::ActionResult { .. } => Ok(()),
         _ => Err(anyhow!(
-            "Pi local runtime currently supports only plain text Agent Mode prompts. \
-Code reviews, skills, generated project flows, action continuations, and other structured \
-agent inputs require a context bridge before they can be routed safely."
+            "Pi local runtime currently supports user prompts and Warp action-result \
+continuations. Other structured agent inputs still require dedicated prompt adapters."
         )),
     }
 }
@@ -562,18 +787,6 @@ fn plain_prompt_from_input(input: &AIAgentInput) -> Option<&str> {
         AIAgentInput::UserQuery { query, .. } => Some(query),
         _ => None,
     }
-}
-
-fn is_ignorable_base_context(context: &AIAgentContext) -> bool {
-    matches!(
-        context,
-        AIAgentContext::Directory { .. }
-            | AIAgentContext::ExecutionEnvironment(_)
-            | AIAgentContext::CurrentTime { .. }
-            | AIAgentContext::Codebase { .. }
-            | AIAgentContext::Git { .. }
-            | AIAgentContext::Skills { .. }
-    )
 }
 
 enum PiEventAction {
@@ -705,6 +918,62 @@ then restart Warp with \
     } else {
         anyhow!("Pi runtime error: {message}")
     }
+}
+
+fn handle_extension_ui_request(
+    event: &Value,
+    state: &mut PiStreamState,
+) -> Option<(Option<Value>, Vec<api::ResponseEvent>)> {
+    if event.get("type").and_then(Value::as_str) != Some("extension_ui_request") {
+        return None;
+    }
+
+    let id = event.get("id").and_then(Value::as_str)?.to_string();
+    let method = event
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let title = event.get("title").and_then(Value::as_str);
+    let message = event
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("statusText").and_then(Value::as_str))
+        .or_else(|| event.get("text").and_then(Value::as_str));
+
+    let summary = PiToolEvent {
+        tool_call_id: id.clone(),
+        tool_name: format!("extension_ui.{method}"),
+        args: Some(serde_json::json!({
+            "title": title,
+            "message": message.map(|message| truncate_preview(message, 300)),
+        })),
+        outcome: PiToolOutcome::Finished {
+            is_error: false,
+            result_preview: match method {
+                "select" | "confirm" | "input" | "editor" => {
+                    Some("cancelled by Warp OSS fallback UI bridge".to_string())
+                }
+                _ => Some("noted".to_string()),
+            },
+        },
+    };
+    let events = state.push_tool_event(summary);
+
+    let response = match method {
+        "select" | "input" | "editor" => Some(serde_json::json!({
+            "type": "extension_ui_response",
+            "id": id,
+            "cancelled": true,
+        })),
+        "confirm" => Some(serde_json::json!({
+            "type": "extension_ui_response",
+            "id": id,
+            "confirmed": false,
+        })),
+        _ => None,
+    };
+
+    Some((response, events))
 }
 
 fn handle_pi_event(event: &Value, state: &mut PiStreamState) -> anyhow::Result<PiEventAction> {
@@ -1027,13 +1296,16 @@ mod tests {
     use warp_multi_agent_api as api;
 
     use crate::ai::agent::{
-        AIAgentAttachment, AIAgentContext, AIAgentInput, StaticQueryType, UserQueryMode,
+        AIAgentActionId, AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment,
+        AIAgentContext, AIAgentInput, RequestCommandOutputResult, StaticQueryType, TaskId,
+        UserQueryMode,
     };
+    use warp_core::command::ExitCode;
 
     use super::{
-        append_agent_output_event, handle_pi_event, is_pi_local_conversation_token,
-        plain_prompt_from_input, prompt_from_input, sanitize_session_file_stem,
-        validate_plain_prompt_input, PiEventAction, PiStreamState,
+        append_agent_output_event, handle_extension_ui_request, handle_pi_event,
+        is_pi_local_conversation_token, plain_prompt_from_input, prompt_from_input,
+        sanitize_session_file_stem, validate_prompt_input, PiEventAction, PiStreamState,
     };
     use crate::ai::agent::api::ServerConversationToken;
 
@@ -1085,7 +1357,7 @@ mod tests {
     fn accepts_plain_user_query() {
         let input = plain_user_query("explain this repo");
 
-        validate_plain_prompt_input(&input).unwrap();
+        validate_prompt_input(&input).unwrap();
         assert_eq!(plain_prompt_from_input(&input), Some("explain this repo"));
         assert_eq!(
             prompt_from_input(&input),
@@ -1128,7 +1400,7 @@ mod tests {
             intended_agent: Some(api::AgentType::Primary),
         };
 
-        validate_plain_prompt_input(&input).unwrap();
+        validate_prompt_input(&input).unwrap();
         let prompt = prompt_from_input(&input).unwrap();
         assert!(prompt.contains("<warp_context>"));
         assert!(prompt.contains("Current directory: C:\\workspace"));
@@ -1137,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_user_query_with_context() {
+    fn accepts_user_query_with_selected_text_context() {
         let input = AIAgentInput::UserQuery {
             query: "explain this".to_string(),
             context: Arc::from([AIAgentContext::SelectedText("selected code".to_string())]),
@@ -1148,11 +1420,14 @@ mod tests {
             intended_agent: None,
         };
 
-        assert!(validate_plain_prompt_input(&input).is_err());
+        validate_prompt_input(&input).unwrap();
+        let prompt = prompt_from_input(&input).unwrap();
+        assert!(prompt.contains("Selected text:"));
+        assert!(prompt.contains("selected code"));
     }
 
     #[test]
-    fn rejects_user_query_with_attachment() {
+    fn accepts_user_query_with_text_attachment() {
         let mut referenced_attachments = HashMap::new();
         referenced_attachments.insert(
             "plan".to_string(),
@@ -1169,11 +1444,14 @@ mod tests {
             intended_agent: None,
         };
 
-        assert!(validate_plain_prompt_input(&input).is_err());
+        validate_prompt_input(&input).unwrap();
+        let prompt = prompt_from_input(&input).unwrap();
+        assert!(prompt.contains("Attachment plan:"));
+        assert!(prompt.contains("hidden attachment text"));
     }
 
     #[test]
-    fn rejects_mode_and_static_query_metadata() {
+    fn accepts_mode_and_static_query_metadata() {
         let input = AIAgentInput::UserQuery {
             query: "make a plan".to_string(),
             context: Vec::<AIAgentContext>::new().into(),
@@ -1184,7 +1462,10 @@ mod tests {
             intended_agent: None,
         };
 
-        assert!(validate_plain_prompt_input(&input).is_err());
+        validate_prompt_input(&input).unwrap();
+        let prompt = prompt_from_input(&input).unwrap();
+        assert!(prompt.contains("Warp entrypoint query type: Code"));
+        assert!(prompt.contains("Warp query mode: Plan"));
     }
 
     #[test]
@@ -1199,7 +1480,7 @@ mod tests {
             intended_agent: Some(api::AgentType::Cli),
         };
 
-        assert!(validate_plain_prompt_input(&input).is_err());
+        assert!(validate_prompt_input(&input).is_err());
     }
 
     #[test]
@@ -1210,9 +1491,34 @@ mod tests {
         };
 
         assert!(input.user_query().is_some());
-        assert!(validate_plain_prompt_input(&input).is_err());
+        assert!(validate_prompt_input(&input).is_err());
         assert_eq!(plain_prompt_from_input(&input), None);
         assert_eq!(prompt_from_input(&input), None);
+    }
+
+    #[test]
+    fn accepts_action_result_continuation_prompt() {
+        let input = AIAgentInput::ActionResult {
+            result: AIAgentActionResult {
+                id: AIAgentActionId::from("action-1".to_string()),
+                task_id: TaskId::new("task-1".to_string()),
+                result: AIAgentActionResultType::RequestCommandOutput(
+                    RequestCommandOutputResult::Completed {
+                        block_id: Default::default(),
+                        command: "echo hi".to_string(),
+                        output: "hi".to_string(),
+                        exit_code: ExitCode::from(0),
+                    },
+                ),
+            },
+            context: Vec::<AIAgentContext>::new().into(),
+        };
+
+        validate_prompt_input(&input).unwrap();
+        let prompt = prompt_from_input(&input).unwrap();
+        assert!(prompt.contains("<warp_action_result id=\"action-1\" task_id=\"task-1\">"));
+        assert!(prompt.contains("echo hi"));
+        assert!(prompt.contains("Continue from the Warp action result above."));
     }
 
     #[test]
@@ -1267,6 +1573,54 @@ mod tests {
         assert_eq!(events.len(), 1);
         let text = event_agent_output_text(&events[0]).unwrap();
         assert!(text.contains("completed read (call_1): file contents"));
+    }
+
+    #[test]
+    fn extension_ui_dialog_requests_are_cancelled_without_deadlock() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+        let (response, events) = handle_extension_ui_request(
+            &json!({
+                "type": "extension_ui_request",
+                "id": "dialog-1",
+                "method": "confirm",
+                "title": "Allow?",
+                "message": "Run command?"
+            }),
+            &mut state,
+        )
+        .expect("expected extension ui handling");
+
+        assert_eq!(
+            response,
+            Some(json!({
+                "type": "extension_ui_response",
+                "id": "dialog-1",
+                "confirmed": false,
+            }))
+        );
+        assert!(event_agent_output_text(&events[0])
+            .unwrap()
+            .contains("extension_ui.confirm"));
+    }
+
+    #[test]
+    fn extension_ui_fire_and_forget_requests_do_not_get_responses() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+        let (response, events) = handle_extension_ui_request(
+            &json!({
+                "type": "extension_ui_request",
+                "id": "notify-1",
+                "method": "notify",
+                "message": "hello"
+            }),
+            &mut state,
+        )
+        .expect("expected extension ui handling");
+
+        assert_eq!(response, None);
+        assert!(event_agent_output_text(&events[0])
+            .unwrap()
+            .contains("extension_ui.notify"));
     }
 
     #[test]
