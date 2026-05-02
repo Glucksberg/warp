@@ -81,21 +81,21 @@ provider environment variables when those variables are not already set.
 
 ## Current scope
 
-The adapter maps a Warp Agent Mode prompt to `pi --mode rpc`, collects the
-assistant text, and renders it in the existing Warp agent conversation UI. It
-uses Pi's session file support to preserve conversation history across normal
-follow-up prompts in the same local Warp conversation.
+The adapter maps a Warp Agent Mode prompt to `pi --mode rpc`, streams assistant
+text deltas into the existing Warp agent conversation UI, and uses Pi's session
+file support to preserve conversation history across normal follow-up prompts in
+the same local Warp conversation.
 
 The prompt sent to Pi includes a small safe context block for current directory,
 home directory, execution environment, current time, indexed codebase, git head,
 branch, and available skill names/descriptions when Warp provides them.
 
-The adapter mirrors Pi tool lifecycle events into a compact "Pi tool activity"
-message before the final assistant answer. This exposes which local tools ran
-without asking Warp to execute the same tool call a second time.
+The adapter mirrors Pi tool lifecycle events into a compact streamed "Pi tool
+activity" message. This exposes which local tools ran without asking Warp to
+execute the same tool call a second time.
 
 Resumed/forked server conversations, action-result continuations, native Warp
-tool approval/execution for mutating tools, live deltas, file diffs, and
-extension UI requests are intentionally left for the next integration layer.
-Until that richer bridge exists, the adapter rejects context-dependent requests
-instead of sending an incomplete prompt to Pi.
+tool approval/execution for mutating tools, file diffs, and extension UI
+requests are intentionally left for the next integration layer. Until that
+richer bridge exists, the adapter rejects context-dependent requests instead of
+sending an incomplete prompt to Pi.

@@ -48,76 +48,180 @@ pub async fn generate_multi_agent_output(
     cancellation_rx: futures::channel::oneshot::Receiver<()>,
 ) -> ResponseStream {
     Box::pin(async_stream::stream! {
-        match run_pi_agent(params, cancellation_rx).await {
-            Ok(events) => {
-                for event in events {
-                    yield Ok(event);
-                }
-            }
+        let request_id = Uuid::new_v4().to_string();
+        let conversation_id = params
+            .conversation_token
+            .as_ref()
+            .map(ServerConversationToken::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("pi-local-{}", Uuid::new_v4()));
+        let run_id = format!("pi-run-{}", Uuid::new_v4());
+        let task_id = params
+            .tasks
+            .first()
+            .map(|task| task.id.clone())
+            .unwrap_or_else(|| format!("pi-root-task-{conversation_id}"));
+        let should_create_root_task = params.tasks.is_empty();
+
+        if let Err(err) = validate_one_shot_request(&params) {
+            yield Err(Arc::new(AIApiError::Other(err)));
+            return;
+        }
+
+        let prompt = match prompt_from_params(&params)
+            .filter(|prompt| !prompt.trim().is_empty())
+            .ok_or_else(|| anyhow!("Pi local agent requires a user prompt")) {
+            Ok(prompt) => prompt,
             Err(err) => {
                 yield Err(Arc::new(AIApiError::Other(err)));
+                return;
+            }
+        };
+
+        let mut child = match pi_command(&params, &conversation_id)
+            .and_then(|mut command| {
+                command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .with_context(|| {
+                        format!(
+                            "Failed to start Pi runtime. Install @mariozechner/pi-coding-agent or set {PI_COMMAND_ENV}"
+                        )
+                    })
+            }) {
+            Ok(child) => child,
+            Err(err) => {
+                yield Err(Arc::new(AIApiError::Other(err)));
+                return;
+            }
+        };
+
+        let mut stdin = match child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Pi runtime stdin was unavailable")) {
+            Ok(stdin) => stdin,
+            Err(err) => {
+                yield Err(Arc::new(AIApiError::Other(err)));
+                let _ = child.kill();
+                return;
+            }
+        };
+        let stdout = match child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Pi runtime stdout was unavailable")) {
+            Ok(stdout) => stdout,
+            Err(err) => {
+                yield Err(Arc::new(AIApiError::Other(err)));
+                let _ = child.kill();
+                return;
+            }
+        };
+
+        yield Ok(init_event(
+            request_id.clone(),
+            conversation_id.clone(),
+            run_id,
+        ));
+        if should_create_root_task {
+            yield Ok(create_root_task_event(task_id.clone()));
+        }
+
+        let prompt_command = serde_json::json!({
+            "id": request_id.clone(),
+            "type": "prompt",
+            "message": prompt,
+        });
+        if let Err(err) = write_pi_prompt(&mut stdin, &prompt_command).await {
+            yield Err(Arc::new(AIApiError::Other(err)));
+            let _ = child.kill();
+            return;
+        }
+
+        let mut lines = BufReader::new(stdout).lines();
+        let mut stream_state = PiStreamState::new(task_id.clone(), request_id.clone());
+        let mut cancellation_rx = cancellation_rx.fuse();
+
+        loop {
+            futures::select! {
+                _ = cancellation_rx => {
+                    let _ = stdin.write_all(b"{\"type\":\"abort\"}\n").await;
+                    let _ = stdin.flush().await;
+                    let _ = child.kill();
+                    return;
+                }
+                line = lines.next().fuse() => {
+                    let Some(line) = line else {
+                        break;
+                    };
+                    let line = match line.context("Failed reading Pi runtime output") {
+                        Ok(line) => line,
+                        Err(err) => {
+                            yield Err(Arc::new(AIApiError::Other(err)));
+                            let _ = child.kill();
+                            return;
+                        }
+                    };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let event: Value = match serde_json::from_str(&line)
+                        .with_context(|| format!("Pi runtime emitted invalid JSON: {line}")) {
+                        Ok(event) => event,
+                        Err(err) => {
+                            yield Err(Arc::new(AIApiError::Other(err)));
+                            let _ = child.kill();
+                            return;
+                        }
+                    };
+
+                    match handle_pi_event(&event, &mut stream_state) {
+                        Ok(PiEventAction::Continue(events)) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
+                        }
+                        Ok(PiEventAction::Finish(events)) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
+                            break;
+                        }
+                        Ok(PiEventAction::Error(message)) => {
+                            yield Err(Arc::new(AIApiError::Other(pi_runtime_error(message))));
+                            let _ = child.kill();
+                            return;
+                        }
+                        Err(err) => {
+                            yield Err(Arc::new(AIApiError::Other(err)));
+                            let _ = child.kill();
+                            return;
+                        }
+                    }
+                }
             }
         }
+
+        if !stream_state.has_assistant_output() {
+            yield Err(Arc::new(AIApiError::Other(anyhow!(
+                "Pi runtime completed without assistant output. Check Pi authentication, selected model, and local Pi logs."
+            ))));
+            let _ = child.kill();
+            return;
+        }
+
+        yield Ok(finished_event());
+        let _ = child.kill();
     })
 }
 
-async fn run_pi_agent(
-    params: RequestParams,
-    cancellation_rx: futures::channel::oneshot::Receiver<()>,
-) -> anyhow::Result<Vec<api::ResponseEvent>> {
-    let mut events = Vec::new();
-    let request_id = Uuid::new_v4().to_string();
-    let conversation_id = params
-        .conversation_token
-        .as_ref()
-        .map(ServerConversationToken::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("pi-local-{}", Uuid::new_v4()));
-    let run_id = format!("pi-run-{}", Uuid::new_v4());
-    let task_id = params
-        .tasks
-        .first()
-        .map(|task| task.id.clone())
-        .unwrap_or_else(|| format!("pi-root-task-{conversation_id}"));
-    let should_create_root_task = params.tasks.is_empty();
-
-    validate_one_shot_request(&params)?;
-
-    let prompt = prompt_from_params(&params)
-        .filter(|prompt| !prompt.trim().is_empty())
-        .ok_or_else(|| anyhow!("Pi local agent requires a user prompt"))?;
-
-    events.push(init_event(
-        request_id.clone(),
-        conversation_id.clone(),
-        run_id,
-    ));
-
-    let mut child = pi_command(&params, &conversation_id)?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "Failed to start Pi runtime. Install @mariozechner/pi-coding-agent or set {PI_COMMAND_ENV}"
-            )
-        })?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("Pi runtime stdin was unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("Pi runtime stdout was unavailable"))?;
-
-    let prompt_command = serde_json::json!({
-        "id": request_id.clone(),
-        "type": "prompt",
-        "message": prompt,
-    });
+async fn write_pi_prompt(
+    stdin: &mut async_process::ChildStdin,
+    prompt_command: &Value,
+) -> anyhow::Result<()> {
     stdin
         .write_all(prompt_command.to_string().as_bytes())
         .await
@@ -126,65 +230,7 @@ async fn run_pi_agent(
         .write_all(b"\n")
         .await
         .context("Failed to finish Pi prompt frame")?;
-    stdin.flush().await.context("Failed to flush Pi stdin")?;
-
-    let mut lines = BufReader::new(stdout).lines();
-    let mut pi_output = PiOutput::default();
-    let mut cancellation_rx = cancellation_rx.fuse();
-
-    loop {
-        futures::select! {
-            _ = cancellation_rx => {
-                let _ = stdin.write_all(b"{\"type\":\"abort\"}\n").await;
-                let _ = stdin.flush().await;
-                let _ = child.kill();
-                break;
-            }
-            line = lines.next().fuse() => {
-                let Some(line) = line else {
-                    break;
-                };
-                let line = line.context("Failed reading Pi runtime output")?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let event: Value = serde_json::from_str(&line)
-                    .with_context(|| format!("Pi runtime emitted invalid JSON: {line}"))?;
-                match handle_pi_event(&event, &mut pi_output)? {
-                    PiEventAction::Continue => {}
-                    PiEventAction::Finish => break,
-                    PiEventAction::Error(message) => return Err(pi_runtime_error(message)),
-                }
-            }
-        }
-    }
-
-    if pi_output.assistant_text.trim().is_empty() {
-        let _ = child.kill();
-        return Err(anyhow!(
-            "Pi runtime completed without assistant output. Check Pi authentication, selected model, and local Pi logs."
-        ));
-    }
-
-    if should_create_root_task {
-        events.push(create_root_task_event(task_id.clone()));
-    }
-    if let Some(tool_summary) = pi_output.tool_summary() {
-        events.push(add_agent_output_event(
-            task_id.clone(),
-            request_id.clone(),
-            tool_summary,
-        ));
-    }
-    events.push(add_agent_output_event(
-        task_id,
-        request_id.clone(),
-        pi_output.assistant_text,
-    ));
-
-    events.push(finished_event());
-    let _ = child.kill();
-    Ok(events)
+    stdin.flush().await.context("Failed to flush Pi stdin")
 }
 
 fn pi_command(params: &RequestParams, conversation_id: &str) -> anyhow::Result<Command> {
@@ -531,29 +577,80 @@ fn is_ignorable_base_context(context: &AIAgentContext) -> bool {
 }
 
 enum PiEventAction {
-    Continue,
-    Finish,
+    Continue(Vec<api::ResponseEvent>),
+    Finish(Vec<api::ResponseEvent>),
     Error(String),
 }
 
-#[derive(Default)]
-struct PiOutput {
-    assistant_text: String,
-    tool_events: Vec<PiToolEvent>,
+struct PiStreamState {
+    task_id: String,
+    request_id: String,
+    assistant_message_id: String,
+    tool_message_id: String,
+    assistant_message_started: bool,
+    tool_message_started: bool,
+    assistant_output_seen: bool,
 }
 
-impl PiOutput {
-    fn tool_summary(&self) -> Option<String> {
-        if self.tool_events.is_empty() {
-            return None;
+impl PiStreamState {
+    fn new(task_id: String, request_id: String) -> Self {
+        Self {
+            task_id,
+            request_id,
+            assistant_message_id: format!("pi-message-{}", Uuid::new_v4()),
+            tool_message_id: format!("pi-tool-message-{}", Uuid::new_v4()),
+            assistant_message_started: false,
+            tool_message_started: false,
+            assistant_output_seen: false,
+        }
+    }
+
+    fn has_assistant_output(&self) -> bool {
+        self.assistant_output_seen
+    }
+
+    fn push_assistant_delta(&mut self, text: &str) -> Vec<api::ResponseEvent> {
+        if text.is_empty() {
+            return Vec::new();
         }
 
-        let mut lines = Vec::with_capacity(self.tool_events.len() + 1);
-        lines.push("Pi tool activity:".to_string());
-        for event in &self.tool_events {
-            lines.push(event.to_summary_line());
+        self.assistant_output_seen = true;
+        if self.assistant_message_started {
+            vec![append_agent_output_event(
+                self.task_id.clone(),
+                self.request_id.clone(),
+                self.assistant_message_id.clone(),
+                text.to_string(),
+            )]
+        } else {
+            self.assistant_message_started = true;
+            vec![add_agent_output_event_with_id(
+                self.task_id.clone(),
+                self.request_id.clone(),
+                self.assistant_message_id.clone(),
+                text.to_string(),
+            )]
         }
-        Some(lines.join("\n"))
+    }
+
+    fn push_tool_event(&mut self, event: PiToolEvent) -> Vec<api::ResponseEvent> {
+        let line = event.to_summary_line();
+        if self.tool_message_started {
+            vec![append_agent_output_event(
+                self.task_id.clone(),
+                self.request_id.clone(),
+                self.tool_message_id.clone(),
+                format!("\n{line}"),
+            )]
+        } else {
+            self.tool_message_started = true;
+            vec![add_agent_output_event_with_id(
+                self.task_id.clone(),
+                self.request_id.clone(),
+                self.tool_message_id.clone(),
+                format!("Pi tool activity:\n{line}"),
+            )]
+        }
     }
 }
 
@@ -610,7 +707,7 @@ then restart Warp with \
     }
 }
 
-fn handle_pi_event(event: &Value, output: &mut PiOutput) -> anyhow::Result<PiEventAction> {
+fn handle_pi_event(event: &Value, state: &mut PiStreamState) -> anyhow::Result<PiEventAction> {
     match event.get("type").and_then(Value::as_str) {
         Some("response") => {
             if event.get("success").and_then(Value::as_bool) == Some(false) {
@@ -622,7 +719,7 @@ fn handle_pi_event(event: &Value, output: &mut PiOutput) -> anyhow::Result<PiEve
                         .to_string(),
                 ));
             }
-            Ok(PiEventAction::Continue)
+            Ok(PiEventAction::Continue(Vec::new()))
         }
         Some("message_update") => {
             let assistant_event = event.get("assistantMessageEvent");
@@ -636,8 +733,8 @@ fn handle_pi_event(event: &Value, output: &mut PiOutput) -> anyhow::Result<PiEve
                 .and_then(|event| event.get("delta"))
                 .and_then(Value::as_str)
             {
-                output.assistant_text.push_str(delta);
-            } else if output.assistant_text.is_empty() {
+                Ok(PiEventAction::Continue(state.push_assistant_delta(delta)))
+            } else if !state.has_assistant_output() {
                 if let Some(text) = assistant_event
                     .filter(|event| {
                         event
@@ -648,21 +745,25 @@ fn handle_pi_event(event: &Value, output: &mut PiOutput) -> anyhow::Result<PiEve
                     .and_then(|event| event.get("content"))
                     .and_then(Value::as_str)
                 {
-                    output.assistant_text.push_str(text);
+                    Ok(PiEventAction::Continue(state.push_assistant_delta(text)))
+                } else {
+                    Ok(PiEventAction::Continue(Vec::new()))
                 }
+            } else {
+                Ok(PiEventAction::Continue(Vec::new()))
             }
-            Ok(PiEventAction::Continue)
         }
         Some("message_end") | Some("turn_end") => {
-            if output.assistant_text.is_empty() {
+            if !state.has_assistant_output() {
                 if let Some(text) = extract_message_text(event.get("message")) {
-                    output.assistant_text.push_str(&text);
+                    return Ok(PiEventAction::Continue(state.push_assistant_delta(&text)));
                 }
             }
-            Ok(PiEventAction::Continue)
+            Ok(PiEventAction::Continue(Vec::new()))
         }
         Some("agent_end") => {
-            if output.assistant_text.is_empty() {
+            let mut events = Vec::new();
+            if !state.has_assistant_output() {
                 if let Some(text) =
                     event
                         .get("messages")
@@ -674,22 +775,22 @@ fn handle_pi_event(event: &Value, output: &mut PiOutput) -> anyhow::Result<PiEve
                                 .find_map(|m| extract_message_text(Some(m)))
                         })
                 {
-                    output.assistant_text.push_str(&text);
+                    events.extend(state.push_assistant_delta(&text));
                 }
             }
-            Ok(PiEventAction::Finish)
+            Ok(PiEventAction::Finish(events))
         }
         Some("tool_execution_start") => {
-            output.tool_events.push(PiToolEvent {
+            let event = PiToolEvent {
                 tool_call_id: event_string(event, "toolCallId").unwrap_or_else(|| "unknown".into()),
                 tool_name: event_string(event, "toolName").unwrap_or_else(|| "tool".into()),
                 args: event.get("args").cloned(),
                 outcome: PiToolOutcome::Started,
-            });
-            Ok(PiEventAction::Continue)
+            };
+            Ok(PiEventAction::Continue(state.push_tool_event(event)))
         }
         Some("tool_execution_end") => {
-            output.tool_events.push(PiToolEvent {
+            let event = PiToolEvent {
                 tool_call_id: event_string(event, "toolCallId").unwrap_or_else(|| "unknown".into()),
                 tool_name: event_string(event, "toolName").unwrap_or_else(|| "tool".into()),
                 args: event.get("args").cloned(),
@@ -700,8 +801,8 @@ fn handle_pi_event(event: &Value, output: &mut PiOutput) -> anyhow::Result<PiEve
                         .unwrap_or(false),
                     result_preview: extract_tool_result_preview(event.get("result")),
                 },
-            });
-            Ok(PiEventAction::Continue)
+            };
+            Ok(PiEventAction::Continue(state.push_tool_event(event)))
         }
         Some("auto_retry_end") if event.get("success").and_then(Value::as_bool) == Some(false) => {
             Ok(PiEventAction::Error(
@@ -719,7 +820,7 @@ fn handle_pi_event(event: &Value, output: &mut PiOutput) -> anyhow::Result<PiEve
                 .unwrap_or("extension error")
                 .to_string(),
         )),
-        _ => Ok(PiEventAction::Continue),
+        _ => Ok(PiEventAction::Continue(Vec::new())),
     }
 }
 
@@ -809,7 +910,12 @@ fn init_event(request_id: String, conversation_id: String, run_id: String) -> ap
     }
 }
 
-fn add_agent_output_event(task_id: String, request_id: String, text: String) -> api::ResponseEvent {
+fn add_agent_output_event_with_id(
+    task_id: String,
+    request_id: String,
+    message_id: String,
+    text: String,
+) -> api::ResponseEvent {
     api::ResponseEvent {
         r#type: Some(api::response_event::Type::ClientActions(
             api::response_event::ClientActions {
@@ -818,7 +924,7 @@ fn add_agent_output_event(task_id: String, request_id: String, text: String) -> 
                         api::client_action::AddMessagesToTask {
                             task_id: task_id.clone(),
                             messages: vec![api::Message {
-                                id: format!("pi-message-{}", Uuid::new_v4()),
+                                id: message_id,
                                 task_id,
                                 server_message_data: String::new(),
                                 citations: vec![],
@@ -828,6 +934,41 @@ fn add_agent_output_event(task_id: String, request_id: String, text: String) -> 
                                 request_id,
                                 timestamp: None,
                             }],
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
+fn append_agent_output_event(
+    task_id: String,
+    request_id: String,
+    message_id: String,
+    text: String,
+) -> api::ResponseEvent {
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::AppendToMessageContent(
+                        api::client_action::AppendToMessageContent {
+                            task_id: task_id.clone(),
+                            message: Some(api::Message {
+                                id: message_id,
+                                task_id,
+                                server_message_data: String::new(),
+                                citations: vec![],
+                                message: Some(api::message::Message::AgentOutput(
+                                    api::message::AgentOutput { text },
+                                )),
+                                request_id,
+                                timestamp: None,
+                            }),
+                            mask: Some(prost_types::FieldMask {
+                                paths: vec!["agent_output.text".to_string()],
+                            }),
                         },
                     )),
                 }],
@@ -881,6 +1022,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Local;
+    use field_mask::FieldMaskOperation;
     use serde_json::json;
     use warp_multi_agent_api as api;
 
@@ -889,9 +1031,9 @@ mod tests {
     };
 
     use super::{
-        handle_pi_event, is_pi_local_conversation_token, plain_prompt_from_input,
-        prompt_from_input, sanitize_session_file_stem, validate_plain_prompt_input, PiEventAction,
-        PiOutput,
+        append_agent_output_event, handle_pi_event, is_pi_local_conversation_token,
+        plain_prompt_from_input, prompt_from_input, sanitize_session_file_stem,
+        validate_plain_prompt_input, PiEventAction, PiStreamState,
     };
     use crate::ai::agent::api::ServerConversationToken;
 
@@ -904,6 +1046,38 @@ mod tests {
             user_query_mode: UserQueryMode::Normal,
             running_command: None,
             intended_agent: None,
+        }
+    }
+
+    fn event_agent_output_text(event: &api::ResponseEvent) -> Option<&str> {
+        let api::response_event::Type::ClientActions(actions) = event.r#type.as_ref()? else {
+            return None;
+        };
+        let action = actions.actions.first()?.action.as_ref()?;
+        let message = match action {
+            api::client_action::Action::AddMessagesToTask(add) => add.messages.first(),
+            api::client_action::Action::AppendToMessageContent(append) => append.message.as_ref(),
+            _ => None,
+        }?;
+        let api::message::Message::AgentOutput(output) = message.message.as_ref()? else {
+            return None;
+        };
+        Some(&output.text)
+    }
+
+    fn agent_output_message(id: &str, text: &str) -> api::Message {
+        api::Message {
+            id: id.to_string(),
+            task_id: "task".to_string(),
+            server_message_data: String::new(),
+            citations: vec![],
+            message: Some(api::message::Message::AgentOutput(
+                api::message::AgentOutput {
+                    text: text.to_string(),
+                },
+            )),
+            request_id: "request".to_string(),
+            timestamp: None,
         }
     }
 
@@ -1050,8 +1224,8 @@ mod tests {
     }
 
     #[test]
-    fn records_pi_tool_lifecycle_summary() {
-        let mut output = PiOutput::default();
+    fn records_pi_tool_lifecycle_events_as_streamed_messages() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
 
         let action = handle_pi_event(
             &json!({
@@ -1060,12 +1234,19 @@ mod tests {
                 "toolName": "read",
                 "args": { "path": "README.md" }
             }),
-            &mut output,
+            &mut state,
         )
         .unwrap();
-        assert!(matches!(action, PiEventAction::Continue));
+        let PiEventAction::Continue(events) = action else {
+            panic!("expected continue action");
+        };
+        assert_eq!(events.len(), 1);
+        let text = event_agent_output_text(&events[0]).unwrap();
+        assert!(text.contains("Pi tool activity:"));
+        assert!(text.contains("started read (call_1)"));
+        assert!(text.contains("{\"path\":\"README.md\"}"));
 
-        handle_pi_event(
+        let action = handle_pi_event(
             &json!({
                 "type": "tool_execution_end",
                 "toolCallId": "call_1",
@@ -1077,21 +1258,22 @@ mod tests {
                     ]
                 }
             }),
-            &mut output,
+            &mut state,
         )
         .unwrap();
-
-        let summary = output.tool_summary().unwrap();
-        assert!(summary.contains("started read (call_1)"));
-        assert!(summary.contains("{\"path\":\"README.md\"}"));
-        assert!(summary.contains("completed read (call_1): file contents"));
+        let PiEventAction::Continue(events) = action else {
+            panic!("expected continue action");
+        };
+        assert_eq!(events.len(), 1);
+        let text = event_agent_output_text(&events[0]).unwrap();
+        assert!(text.contains("completed read (call_1): file contents"));
     }
 
     #[test]
     fn pi_agent_text_and_tool_events_are_kept_separate() {
-        let mut output = PiOutput::default();
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
 
-        handle_pi_event(
+        let tool_action = handle_pi_event(
             &json!({
                 "type": "tool_execution_end",
                 "toolCallId": "call_1",
@@ -1103,10 +1285,10 @@ mod tests {
                     ]
                 }
             }),
-            &mut output,
+            &mut state,
         )
         .unwrap();
-        handle_pi_event(
+        let text_action = handle_pi_event(
             &json!({
                 "type": "message_update",
                 "assistantMessageEvent": {
@@ -1114,11 +1296,69 @@ mod tests {
                     "delta": "hello"
                 }
             }),
-            &mut output,
+            &mut state,
         )
         .unwrap();
 
-        assert_eq!(output.assistant_text, "hello");
-        assert!(output.tool_summary().unwrap().contains("failed grep"));
+        assert!(state.has_assistant_output());
+        let PiEventAction::Continue(tool_events) = tool_action else {
+            panic!("expected tool continue action");
+        };
+        let PiEventAction::Continue(text_events) = text_action else {
+            panic!("expected text continue action");
+        };
+        assert!(event_agent_output_text(&tool_events[0])
+            .unwrap()
+            .contains("failed grep"));
+        assert_eq!(event_agent_output_text(&text_events[0]), Some("hello"));
+    }
+
+    #[test]
+    fn append_agent_output_field_mask_appends_text() {
+        let existing = agent_output_message("message", "hel");
+        let append = append_agent_output_event(
+            "task".to_string(),
+            "request".to_string(),
+            "message".to_string(),
+            "lo".to_string(),
+        );
+        let api::response_event::Type::ClientActions(actions) = append.r#type.unwrap() else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::AppendToMessageContent(append)) = actions
+            .actions
+            .into_iter()
+            .next()
+            .and_then(|action| action.action)
+        else {
+            panic!("expected append action");
+        };
+
+        let merged = FieldMaskOperation::append(
+            &api::MESSAGE_DESCRIPTOR,
+            &existing,
+            &append.message.unwrap(),
+            append.mask.unwrap(),
+        )
+        .apply()
+        .unwrap();
+
+        assert_eq!(
+            event_agent_output_text(&api::ResponseEvent {
+                r#type: Some(api::response_event::Type::ClientActions(
+                    api::response_event::ClientActions {
+                        actions: vec![api::ClientAction {
+                            action: Some(api::client_action::Action::AddMessagesToTask(
+                                api::client_action::AddMessagesToTask {
+                                    task_id: "task".to_string(),
+                                    messages: vec![merged],
+                                },
+                            )),
+                        }],
+                    },
+                )),
+            }),
+            Some("hello")
+        );
     }
 }
