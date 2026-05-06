@@ -122,11 +122,13 @@ Resolve conflicts in this order:
 Minimum validation after every sync:
 
 ```powershell
-$env:PROTOC = "$env:APPDATA\npm\protoc.cmd"
-cargo test -p warp pi_local --lib --features gui
-cargo check -p warp --bin warp-oss --features gui
-git diff --check
+.\script\local\check_pi_runtime.ps1
 ```
+
+This script sets `PROTOC`, runs the focused Pi runtime tests, checks the
+`warp-oss` GUI binary, and runs `git diff --check`. Use
+`-SkipCargoCheck` only while iterating on test failures; do not use it for final
+sync validation.
 
 Functional smoke test:
 
