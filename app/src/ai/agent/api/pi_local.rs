@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context as _};
+use anyhow::{Context as _, anyhow};
 use async_process::Command;
 use futures::FutureExt as _;
-use futures_lite::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use futures_lite::StreamExt as _;
+use futures_lite::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use serde_json::Value;
 use uuid::Uuid;
 use warp_multi_agent_api as api;
@@ -1178,6 +1178,15 @@ fn handle_pi_event(event: &Value, state: &mut PiStreamState) -> anyhow::Result<P
             if let Some(events) = proxy_tool_call_to_warp(event, state) {
                 return Ok(PiEventAction::Finish(events));
             }
+            if should_proxy_tool_call_to_warp(event) {
+                let tool_name = event
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                return Ok(PiEventAction::Error(format!(
+                    "Warp could not proxy Pi tool \"{tool_name}\" because its arguments were missing or invalid."
+                )));
+            }
 
             let event = PiToolEvent {
                 tool_call_id: event_string(event, "toolCallId").unwrap_or_else(|| "unknown".into()),
@@ -1222,13 +1231,33 @@ fn handle_pi_event(event: &Value, state: &mut PiStreamState) -> anyhow::Result<P
     }
 }
 
+fn should_proxy_tool_call_to_warp(event: &Value) -> bool {
+    if env_flag_is_enabled(PI_DISABLE_ACTION_PROXY_ENV)
+        || env_flag_is_enabled("WARP_PI_ALLOW_UNBRIDGED_MUTATING_TOOLS")
+    {
+        return false;
+    }
+
+    matches!(
+        event.get("toolName").and_then(Value::as_str),
+        Some(
+            "bash"
+                | "edit"
+                | "write"
+                | "warp_mcp_call"
+                | "warp_mcp_read_resource"
+                | "warp_lrc_write"
+                | "warp_lrc_read"
+                | "warp_lrc_transfer"
+        )
+    )
+}
+
 fn proxy_tool_call_to_warp(
     event: &Value,
     state: &mut PiStreamState,
 ) -> Option<Vec<api::ResponseEvent>> {
-    if env_flag_is_enabled(PI_DISABLE_ACTION_PROXY_ENV)
-        || env_flag_is_enabled("WARP_PI_ALLOW_UNBRIDGED_MUTATING_TOOLS")
-    {
+    if !should_proxy_tool_call_to_warp(event) {
         return None;
     }
 
@@ -1272,7 +1301,7 @@ fn build_edit_tool_call(args: Option<&Value>) -> Option<api::message::tool_call:
     if let Some(edits) = args.get("edits").and_then(Value::as_array) {
         for edit in edits {
             let search = string_arg(edit, &["oldText", "old_text", "search"])?;
-            let replace = string_arg(edit, &["newText", "new_text", "replace"])?;
+            let replace = optional_string_arg(edit, &["newText", "new_text", "replace"])?;
             diffs.push(api::message::tool_call::apply_file_diffs::FileDiff {
                 file_path: file_path.clone(),
                 search,
@@ -1283,7 +1312,7 @@ fn build_edit_tool_call(args: Option<&Value>) -> Option<api::message::tool_call:
         diffs.push(api::message::tool_call::apply_file_diffs::FileDiff {
             file_path: file_path.clone(),
             search: string_arg(args, &["oldText", "old_text", "search"])?,
-            replace: string_arg(args, &["newText", "new_text", "replace"])?,
+            replace: optional_string_arg(args, &["newText", "new_text", "replace"])?,
         });
     }
 
@@ -1304,7 +1333,7 @@ fn build_write_tool_call(
 ) -> Option<api::message::tool_call::Tool> {
     let args = args?;
     let file_path = path_arg(args)?;
-    let content = string_arg(args, &["content"])?;
+    let content = optional_string_arg(args, &["content"])?;
     let existing_content = resolve_existing_text_file(args, &file_path, current_working_directory);
 
     let (diffs, new_files) = if let Some(existing_content) = existing_content {
@@ -1382,7 +1411,7 @@ fn build_lrc_write_tool_call(args: Option<&Value>) -> Option<api::message::tool_
         api::message::tool_call::Tool::WriteToLongRunningShellCommand(
             api::message::tool_call::WriteToLongRunningShellCommand {
                 command_id: string_arg(args, &["commandId", "command_id"])?,
-                input: string_arg(args, &["input"])?.into_bytes(),
+                input: optional_string_arg(args, &["input"])?.into_bytes(),
                 mode: Some(
                     api::message::tool_call::write_to_long_running_shell_command::Mode {
                         mode: Some(mode),
@@ -1796,10 +1825,10 @@ mod tests {
     use warp_core::command::ExitCode;
 
     use super::{
-        add_bash_tool_call_event, append_agent_output_event, handle_extension_ui_request,
-        handle_pi_event, is_pi_local_conversation_token, plain_prompt_from_input,
-        prompt_from_input, sanitize_session_file_stem, validate_prompt_input, PiEventAction,
-        PiStreamState,
+        PiEventAction, PiStreamState, add_bash_tool_call_event, append_agent_output_event,
+        handle_extension_ui_request, handle_pi_event, is_pi_local_conversation_token,
+        plain_prompt_from_input, prompt_from_input, sanitize_session_file_stem,
+        validate_prompt_input,
     };
     use crate::ai::agent::api::ServerConversationToken;
 
@@ -2151,6 +2180,37 @@ mod tests {
     }
 
     #[test]
+    fn pi_edit_tool_allows_empty_replacement_for_deletions() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+
+        let action = handle_pi_event(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_edit_delete",
+                "toolName": "edit",
+                "args": {
+                    "path": "src/main.rs",
+                    "oldText": "println!(\"remove me\");",
+                    "newText": ""
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let PiEventAction::Finish(events) = action else {
+            panic!("expected stream finish for proxied edit deletion");
+        };
+
+        let tool_call = event_tool_call(&events[0]).unwrap();
+        let Some(api::message::tool_call::Tool::ApplyFileDiffs(diff)) = tool_call.tool.as_ref()
+        else {
+            panic!("expected ApplyFileDiffs tool call");
+        };
+        assert_eq!(diff.diffs[0].search, "println!(\"remove me\");");
+        assert_eq!(diff.diffs[0].replace, "");
+    }
+
+    #[test]
     fn pi_write_tool_start_is_proxied_to_native_file_creation_action() {
         let mut state = PiStreamState::new("task".to_string(), "request".to_string());
 
@@ -2183,6 +2243,63 @@ mod tests {
             "__warp_pi_local_test_new_file__.txt"
         );
         assert_eq!(diff.new_files[0].content, "new contents");
+    }
+
+    #[test]
+    fn pi_write_tool_allows_empty_file_content() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+
+        let action = handle_pi_event(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_write_empty",
+                "toolName": "write",
+                "args": {
+                    "path": "__warp_pi_local_test_empty_file__.txt",
+                    "content": ""
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let PiEventAction::Finish(events) = action else {
+            panic!("expected stream finish for proxied empty write");
+        };
+
+        let tool_call = event_tool_call(&events[0]).unwrap();
+        let Some(api::message::tool_call::Tool::ApplyFileDiffs(diff)) = tool_call.tool.as_ref()
+        else {
+            panic!("expected ApplyFileDiffs tool call");
+        };
+        assert_eq!(diff.new_files.len(), 1);
+        assert_eq!(
+            diff.new_files[0].file_path,
+            "__warp_pi_local_test_empty_file__.txt"
+        );
+        assert_eq!(diff.new_files[0].content, "");
+    }
+
+    #[test]
+    fn invalid_proxied_write_is_blocked_instead_of_falling_through() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+
+        let action = handle_pi_event(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_write_invalid",
+                "toolName": "write",
+                "args": {
+                    "path": "__warp_pi_local_test_missing_content__.txt"
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        let PiEventAction::Error(message) = action else {
+            panic!("expected invalid proxied write to be blocked");
+        };
+        assert!(message.contains("could not proxy Pi tool \"write\""));
     }
 
     #[test]
@@ -2358,9 +2475,11 @@ mod tests {
                 "confirmed": false,
             }))
         );
-        assert!(event_agent_output_text(&events[0])
-            .unwrap()
-            .contains("extension_ui.confirm"));
+        assert!(
+            event_agent_output_text(&events[0])
+                .unwrap()
+                .contains("extension_ui.confirm")
+        );
     }
 
     #[test]
@@ -2378,9 +2497,11 @@ mod tests {
         .expect("expected extension ui handling");
 
         assert_eq!(response, None);
-        assert!(event_agent_output_text(&events[0])
-            .unwrap()
-            .contains("extension_ui.notify"));
+        assert!(
+            event_agent_output_text(&events[0])
+                .unwrap()
+                .contains("extension_ui.notify")
+        );
     }
 
     #[test]
@@ -2421,9 +2542,11 @@ mod tests {
         let PiEventAction::Continue(text_events) = text_action else {
             panic!("expected text continue action");
         };
-        assert!(event_agent_output_text(&tool_events[0])
-            .unwrap()
-            .contains("failed grep"));
+        assert!(
+            event_agent_output_text(&tool_events[0])
+                .unwrap()
+                .contains("failed grep")
+        );
         assert_eq!(event_agent_output_text(&text_events[0]), Some("hello"));
     }
 
