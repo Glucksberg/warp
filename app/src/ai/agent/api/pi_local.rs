@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -33,7 +34,9 @@ const DEFAULT_PI_PROVIDER: &str = "openai-codex";
 const DEFAULT_PI_MODEL: &str = "gpt-5.5";
 const DEFAULT_PI_THINKING: &str = "high";
 const READONLY_PI_TOOLS: &str = "read,grep,find,ls";
-const ALL_PI_TOOLS: &str = "read,grep,find,ls,bash,edit,write";
+const WARP_NATIVE_PI_TOOLS: &str = "bash,edit,write,warp_mcp_call,warp_mcp_read_resource,warp_lrc_write,warp_lrc_read,warp_lrc_transfer";
+const DEFAULT_PI_TOOLS: &str = "read,grep,find,ls,bash,edit,write,warp_mcp_call,warp_mcp_read_resource,warp_lrc_write,warp_lrc_read,warp_lrc_transfer";
+const ALL_PI_TOOLS: &str = DEFAULT_PI_TOOLS;
 const PI_TOOL_GATE_EXTENSION_SOURCE: &str =
     include_str!("../../../../resources/pi-runtime/warp-tool-gate.ts");
 
@@ -145,7 +148,15 @@ pub async fn generate_multi_agent_output(
         }
 
         let mut lines = BufReader::new(stdout).lines();
-        let mut stream_state = PiStreamState::new(task_id.clone(), request_id.clone());
+        let mut stream_state = PiStreamState::new_with_cwd(
+            task_id.clone(),
+            request_id.clone(),
+            params
+                .session_context
+                .current_working_directory()
+                .as_ref()
+                .map(PathBuf::from),
+        );
         let mut cancellation_rx = cancellation_rx.fuse();
 
         loop {
@@ -339,7 +350,7 @@ fn configure_tools(command: &mut Command) -> PiToolsConfig {
         .map(|value| value.trim().to_string())
     {
         None => {
-            command.arg("--tools").arg(READONLY_PI_TOOLS);
+            command.arg("--tools").arg(DEFAULT_PI_TOOLS);
             PiToolsConfig::Enabled
         }
         Some(value) if value.is_empty() || value.eq_ignore_ascii_case("none") => {
@@ -349,6 +360,8 @@ fn configure_tools(command: &mut Command) -> PiToolsConfig {
         Some(value) => {
             let normalized = if value.eq_ignore_ascii_case("readonly") {
                 READONLY_PI_TOOLS
+            } else if value.eq_ignore_ascii_case("warp-native") {
+                WARP_NATIVE_PI_TOOLS
             } else if value.eq_ignore_ascii_case("all") {
                 ALL_PI_TOOLS
             } else {
@@ -433,7 +446,12 @@ fn is_pi_local_conversation_token(token: &ServerConversationToken) -> bool {
 }
 
 fn prompt_from_params(params: &RequestParams) -> Option<String> {
-    params.input.iter().rev().find_map(prompt_from_input)
+    let mut prompt = params.input.iter().rev().find_map(prompt_from_input)?;
+    let mcp_context = format_mcp_context(params.mcp_context.as_ref());
+    if let Some(mcp_context) = mcp_context {
+        prompt = format!("{mcp_context}\n\n{prompt}");
+    }
+    Some(prompt)
 }
 
 fn prompt_from_input(input: &AIAgentInput) -> Option<String> {
@@ -484,6 +502,57 @@ fn prompt_from_input(input: &AIAgentInput) -> Option<String> {
         context_lines.join("\n"),
         body
     ))
+}
+
+fn format_mcp_context(mcp_context: Option<&crate::ai::agent::MCPContext>) -> Option<String> {
+    let mcp_context = mcp_context?;
+    let mut lines = Vec::new();
+
+    #[allow(deprecated)]
+    for resource in &mcp_context.resources {
+        lines.push(format!(
+            "- resource uri={} name={}",
+            resource.raw.uri, resource.raw.name
+        ));
+    }
+
+    #[allow(deprecated)]
+    for tool in &mcp_context.tools {
+        let description = tool
+            .description
+            .as_ref()
+            .map(|description| description.to_string())
+            .unwrap_or_default();
+        lines.push(format!("- tool name={} {}", tool.name, description));
+    }
+
+    for server in &mcp_context.servers {
+        lines.push(format!(
+            "- server id={} name={} {}",
+            server.id, server.name, server.description
+        ));
+        for resource in &server.resources {
+            lines.push(format!(
+                "  - resource uri={} name={}",
+                resource.raw.uri, resource.raw.name
+            ));
+        }
+        for tool in &server.tools {
+            let description = tool
+                .description
+                .as_ref()
+                .map(|description| description.to_string())
+                .unwrap_or_default();
+            lines.push(format!("  - tool name={} {}", tool.name, description));
+        }
+    }
+
+    (!lines.is_empty()).then(|| {
+        format!(
+            "<warp_mcp_context>\nUse warp_mcp_call for MCP tools and warp_mcp_read_resource for MCP resources. Include serverId when a server id is listed.\n{}\n</warp_mcp_context>",
+            lines.join("\n")
+        )
+    })
 }
 
 fn add_context_lines(context: &AIAgentContext, lines: &mut Vec<String>) {
@@ -799,6 +868,7 @@ enum PiEventAction {
 struct PiStreamState {
     task_id: String,
     request_id: String,
+    current_working_directory: Option<PathBuf>,
     assistant_message_id: String,
     tool_message_id: String,
     assistant_message_started: bool,
@@ -808,10 +878,20 @@ struct PiStreamState {
 }
 
 impl PiStreamState {
+    #[cfg(test)]
     fn new(task_id: String, request_id: String) -> Self {
+        Self::new_with_cwd(task_id, request_id, None)
+    }
+
+    fn new_with_cwd(
+        task_id: String,
+        request_id: String,
+        current_working_directory: Option<PathBuf>,
+    ) -> Self {
         Self {
             task_id,
             request_id,
+            current_working_directory,
             assistant_message_id: format!("pi-message-{}", Uuid::new_v4()),
             tool_message_id: format!("pi-tool-message-{}", Uuid::new_v4()),
             assistant_message_started: false,
@@ -878,13 +958,36 @@ impl PiStreamState {
         tool_call_id: String,
         command: String,
     ) -> Vec<api::ResponseEvent> {
+        self.push_warp_tool_action(
+            tool_call_id,
+            api::message::tool_call::Tool::RunShellCommand(
+                api::message::tool_call::RunShellCommand {
+                    command,
+                    is_read_only: false,
+                    uses_pager: false,
+                    citations: vec![],
+                    is_risky: true,
+                    risk_category: api::RiskCategory::Risky as i32,
+                    wait_until_complete_value: Some(
+                        api::message::tool_call::run_shell_command::WaitUntilCompleteValue::WaitUntilComplete(true),
+                    ),
+                },
+            ),
+        )
+    }
+
+    fn push_warp_tool_action(
+        &mut self,
+        tool_call_id: String,
+        tool: api::message::tool_call::Tool,
+    ) -> Vec<api::ResponseEvent> {
         self.warp_action_output_seen = true;
-        vec![add_bash_tool_call_event(
+        vec![add_tool_call_event(
             self.task_id.clone(),
             self.request_id.clone(),
             format!("pi-warp-action-message-{}", Uuid::new_v4()),
             tool_call_id,
-            command,
+            tool,
         )]
     }
 }
@@ -1072,7 +1175,7 @@ fn handle_pi_event(event: &Value, state: &mut PiStreamState) -> anyhow::Result<P
             Ok(PiEventAction::Finish(events))
         }
         Some("tool_execution_start") => {
-            if let Some(events) = proxy_bash_tool_call_to_warp(event, state) {
+            if let Some(events) = proxy_tool_call_to_warp(event, state) {
                 return Ok(PiEventAction::Finish(events));
             }
 
@@ -1119,27 +1222,303 @@ fn handle_pi_event(event: &Value, state: &mut PiStreamState) -> anyhow::Result<P
     }
 }
 
-fn proxy_bash_tool_call_to_warp(
+fn proxy_tool_call_to_warp(
     event: &Value,
     state: &mut PiStreamState,
 ) -> Option<Vec<api::ResponseEvent>> {
     if env_flag_is_enabled(PI_DISABLE_ACTION_PROXY_ENV)
         || env_flag_is_enabled("WARP_PI_ALLOW_UNBRIDGED_MUTATING_TOOLS")
-        || event.get("toolName").and_then(Value::as_str) != Some("bash")
     {
         return None;
     }
 
     let tool_call_id = event_string(event, "toolCallId")
-        .unwrap_or_else(|| format!("pi-bash-action-{}", Uuid::new_v4()));
-    let command = event
-        .get("args")
-        .and_then(|args| args.get("command"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .filter(|command| !command.trim().is_empty())?;
+        .unwrap_or_else(|| format!("pi-warp-action-{}", Uuid::new_v4()));
+    let args = event.get("args");
 
-    Some(state.push_warp_bash_action(tool_call_id, command))
+    match event.get("toolName").and_then(Value::as_str)? {
+        "bash" => {
+            let command = args
+                .and_then(|args| args.get("command"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|command| !command.trim().is_empty())?;
+            Some(state.push_warp_bash_action(tool_call_id, command))
+        }
+        "edit" => {
+            build_edit_tool_call(args).map(|tool| state.push_warp_tool_action(tool_call_id, tool))
+        }
+        "write" => build_write_tool_call(args, state.current_working_directory.as_deref())
+            .map(|tool| state.push_warp_tool_action(tool_call_id, tool)),
+        "warp_mcp_call" => build_mcp_call_tool_call(args)
+            .map(|tool| state.push_warp_tool_action(tool_call_id, tool)),
+        "warp_mcp_read_resource" => build_mcp_read_resource_tool_call(args)
+            .map(|tool| state.push_warp_tool_action(tool_call_id, tool)),
+        "warp_lrc_write" => build_lrc_write_tool_call(args)
+            .map(|tool| state.push_warp_tool_action(tool_call_id, tool)),
+        "warp_lrc_read" => build_lrc_read_tool_call(args)
+            .map(|tool| state.push_warp_tool_action(tool_call_id, tool)),
+        "warp_lrc_transfer" => build_lrc_transfer_tool_call(args)
+            .map(|tool| state.push_warp_tool_action(tool_call_id, tool)),
+        _ => None,
+    }
+}
+
+fn build_edit_tool_call(args: Option<&Value>) -> Option<api::message::tool_call::Tool> {
+    let args = args?;
+    let file_path = path_arg(args)?;
+    let mut diffs = Vec::new();
+
+    if let Some(edits) = args.get("edits").and_then(Value::as_array) {
+        for edit in edits {
+            let search = string_arg(edit, &["oldText", "old_text", "search"])?;
+            let replace = string_arg(edit, &["newText", "new_text", "replace"])?;
+            diffs.push(api::message::tool_call::apply_file_diffs::FileDiff {
+                file_path: file_path.clone(),
+                search,
+                replace,
+            });
+        }
+    } else {
+        diffs.push(api::message::tool_call::apply_file_diffs::FileDiff {
+            file_path: file_path.clone(),
+            search: string_arg(args, &["oldText", "old_text", "search"])?,
+            replace: string_arg(args, &["newText", "new_text", "replace"])?,
+        });
+    }
+
+    (!diffs.is_empty()).then(|| {
+        api::message::tool_call::Tool::ApplyFileDiffs(api::message::tool_call::ApplyFileDiffs {
+            summary: format!("Edit {file_path}"),
+            diffs,
+            new_files: vec![],
+            deleted_files: vec![],
+            v4a_updates: vec![],
+        })
+    })
+}
+
+fn build_write_tool_call(
+    args: Option<&Value>,
+    current_working_directory: Option<&Path>,
+) -> Option<api::message::tool_call::Tool> {
+    let args = args?;
+    let file_path = path_arg(args)?;
+    let content = string_arg(args, &["content"])?;
+    let existing_content = resolve_existing_text_file(args, &file_path, current_working_directory);
+
+    let (diffs, new_files) = if let Some(existing_content) = existing_content {
+        (
+            vec![api::message::tool_call::apply_file_diffs::FileDiff {
+                file_path: file_path.clone(),
+                search: existing_content,
+                replace: content,
+            }],
+            vec![],
+        )
+    } else {
+        (
+            vec![],
+            vec![api::message::tool_call::apply_file_diffs::NewFile {
+                file_path: file_path.clone(),
+                content,
+            }],
+        )
+    };
+
+    Some(api::message::tool_call::Tool::ApplyFileDiffs(
+        api::message::tool_call::ApplyFileDiffs {
+            summary: format!("Write {file_path}"),
+            diffs,
+            new_files,
+            deleted_files: vec![],
+            v4a_updates: vec![],
+        },
+    ))
+}
+
+fn build_mcp_call_tool_call(args: Option<&Value>) -> Option<api::message::tool_call::Tool> {
+    let args = args?;
+    let tool_args = args
+        .get("args")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let prost_args = serde_json_to_prost_struct(tool_args).ok()?;
+
+    Some(api::message::tool_call::Tool::CallMcpTool(
+        api::message::tool_call::CallMcpTool {
+            name: string_arg(args, &["name"])?,
+            args: Some(prost_args),
+            server_id: optional_string_arg(args, &["serverId", "server_id"]).unwrap_or_default(),
+        },
+    ))
+}
+
+fn build_mcp_read_resource_tool_call(
+    args: Option<&Value>,
+) -> Option<api::message::tool_call::Tool> {
+    let args = args?;
+    Some(api::message::tool_call::Tool::ReadMcpResource(
+        api::message::tool_call::ReadMcpResource {
+            uri: string_arg(args, &["uri"])?,
+            server_id: optional_string_arg(args, &["serverId", "server_id"]).unwrap_or_default(),
+        },
+    ))
+}
+
+fn build_lrc_write_tool_call(args: Option<&Value>) -> Option<api::message::tool_call::Tool> {
+    let args = args?;
+    let mode = match optional_string_arg(args, &["mode"]).as_deref() {
+        Some("line") => {
+            api::message::tool_call::write_to_long_running_shell_command::mode::Mode::Line(())
+        }
+        Some("block") => {
+            api::message::tool_call::write_to_long_running_shell_command::mode::Mode::Block(())
+        }
+        _ => api::message::tool_call::write_to_long_running_shell_command::mode::Mode::Raw(()),
+    };
+
+    Some(
+        api::message::tool_call::Tool::WriteToLongRunningShellCommand(
+            api::message::tool_call::WriteToLongRunningShellCommand {
+                command_id: string_arg(args, &["commandId", "command_id"])?,
+                input: string_arg(args, &["input"])?.into_bytes(),
+                mode: Some(
+                    api::message::tool_call::write_to_long_running_shell_command::Mode {
+                        mode: Some(mode),
+                    },
+                ),
+            },
+        ),
+    )
+}
+
+fn build_lrc_read_tool_call(args: Option<&Value>) -> Option<api::message::tool_call::Tool> {
+    let args = args?;
+    let delay = if args
+        .get("waitUntilComplete")
+        .or_else(|| args.get("wait_until_complete"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Some(api::message::tool_call::read_shell_command_output::Delay::OnCompletion(()))
+    } else {
+        args.get("delaySeconds")
+            .or_else(|| args.get("delay_seconds"))
+            .and_then(Value::as_i64)
+            .map(|seconds| {
+                api::message::tool_call::read_shell_command_output::Delay::Duration(
+                    prost_types::Duration { seconds, nanos: 0 },
+                )
+            })
+    };
+
+    Some(api::message::tool_call::Tool::ReadShellCommandOutput(
+        api::message::tool_call::ReadShellCommandOutput {
+            command_id: string_arg(args, &["commandId", "command_id"])?,
+            delay,
+        },
+    ))
+}
+
+fn build_lrc_transfer_tool_call(args: Option<&Value>) -> Option<api::message::tool_call::Tool> {
+    let args = args?;
+    Some(
+        api::message::tool_call::Tool::TransferShellCommandControlToUser(
+            api::message::tool_call::TransferShellCommandControlToUser {
+                reason: string_arg(args, &["reason"])?,
+            },
+        ),
+    )
+}
+
+fn path_arg(args: &Value) -> Option<String> {
+    string_arg(args, &["path", "file_path"])
+}
+
+fn string_arg(args: &Value, names: &[&str]) -> Option<String> {
+    optional_string_arg(args, names).filter(|value| !value.trim().is_empty())
+}
+
+fn optional_string_arg(args: &Value, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| args.get(*name).and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+fn resolve_existing_text_file(
+    args: &Value,
+    file_path: &str,
+    current_working_directory: Option<&Path>,
+) -> Option<String> {
+    let path = PathBuf::from(file_path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        current_working_directory
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())?
+            .join(path)
+    };
+
+    read_existing_text_file(&path).or_else(|| {
+        optional_string_arg(
+            args,
+            &[
+                "previousContent",
+                "previous_content",
+                "oldContent",
+                "old_content",
+            ],
+        )
+    })
+}
+
+fn read_existing_text_file(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => None,
+    }
+}
+
+fn serde_json_to_prost_struct(value: Value) -> Result<prost_types::Struct, String> {
+    match serde_json_to_prost(value)? {
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StructValue(value)),
+        } => Ok(value),
+        _ => Err("MCP tool args must be a JSON object".to_string()),
+    }
+}
+
+fn serde_json_to_prost(value: Value) -> Result<prost_types::Value, String> {
+    use prost_types::value::Kind::*;
+    use serde_json::Value::*;
+
+    Ok(prost_types::Value {
+        kind: Some(match value {
+            Null => NullValue(0),
+            Bool(v) => BoolValue(v),
+            Number(n) => NumberValue(
+                n.as_f64()
+                    .ok_or_else(|| format!("float {n} is not valid JSON number"))?,
+            ),
+            String(s) => StringValue(s),
+            Array(a) => ListValue(prost_types::ListValue {
+                values: a
+                    .into_iter()
+                    .map(serde_json_to_prost)
+                    .collect::<Result<Vec<_>, std::string::String>>()?,
+            }),
+            Object(v) => StructValue(prost_types::Struct {
+                fields: v
+                    .into_iter()
+                    .map(|(k, v)| serde_json_to_prost(v).map(|v| (k, v)))
+                    .collect::<Result<BTreeMap<_, _>, std::string::String>>()?,
+            }),
+        }),
+    })
 }
 
 fn event_string(event: &Value, key: &str) -> Option<String> {
@@ -1295,12 +1674,12 @@ fn append_agent_output_event(
     }
 }
 
-fn add_bash_tool_call_event(
+fn add_tool_call_event(
     task_id: String,
     request_id: String,
     message_id: String,
     tool_call_id: String,
-    command: String,
+    tool: api::message::tool_call::Tool,
 ) -> api::ResponseEvent {
     api::ResponseEvent {
         r#type: Some(api::response_event::Type::ClientActions(
@@ -1317,21 +1696,7 @@ fn add_bash_tool_call_event(
                                 message: Some(api::message::Message::ToolCall(
                                     api::message::ToolCall {
                                         tool_call_id,
-                                        tool: Some(
-                                            api::message::tool_call::Tool::RunShellCommand(
-                                                api::message::tool_call::RunShellCommand {
-                                                    command,
-                                                    is_read_only: false,
-                                                    uses_pager: false,
-                                                    citations: vec![],
-                                                    is_risky: true,
-                                                    risk_category: api::RiskCategory::Risky as i32,
-                                                    wait_until_complete_value: Some(
-                                                        api::message::tool_call::run_shell_command::WaitUntilCompleteValue::WaitUntilComplete(true),
-                                                    ),
-                                                },
-                                            ),
-                                        ),
+                                        tool: Some(tool),
                                     },
                                 )),
                                 request_id,
@@ -1343,6 +1708,35 @@ fn add_bash_tool_call_event(
             },
         )),
     }
+}
+
+#[cfg(test)]
+fn add_bash_tool_call_event(
+    task_id: String,
+    request_id: String,
+    message_id: String,
+    tool_call_id: String,
+    command: String,
+) -> api::ResponseEvent {
+    add_tool_call_event(
+        task_id,
+        request_id,
+        message_id,
+        tool_call_id,
+        api::message::tool_call::Tool::RunShellCommand(
+            api::message::tool_call::RunShellCommand {
+                command,
+                is_read_only: false,
+                uses_pager: false,
+                citations: vec![],
+                is_risky: true,
+                risk_category: api::RiskCategory::Risky as i32,
+                wait_until_complete_value: Some(
+                    api::message::tool_call::run_shell_command::WaitUntilCompleteValue::WaitUntilComplete(true),
+                ),
+            },
+        ),
+    )
 }
 
 fn create_root_task_event(task_id: String) -> api::ResponseEvent {
@@ -1718,6 +2112,208 @@ mod tests {
         assert_eq!(command.command, "cargo test");
         assert!(command.is_risky);
         assert_eq!(command.risk_category, api::RiskCategory::Risky as i32);
+    }
+
+    #[test]
+    fn pi_edit_tool_start_is_proxied_to_native_file_diff_action() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+
+        let action = handle_pi_event(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_edit",
+                "toolName": "edit",
+                "args": {
+                    "path": "src/main.rs",
+                    "edits": [
+                        { "oldText": "fn main() {}", "newText": "fn main() { println!(\"hi\"); }" }
+                    ]
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let PiEventAction::Finish(events) = action else {
+            panic!("expected stream finish for proxied edit");
+        };
+
+        let tool_call = event_tool_call(&events[0]).unwrap();
+        assert_eq!(tool_call.tool_call_id, "call_edit");
+        let Some(api::message::tool_call::Tool::ApplyFileDiffs(diff)) = tool_call.tool.as_ref()
+        else {
+            panic!("expected ApplyFileDiffs tool call");
+        };
+        assert_eq!(diff.summary, "Edit src/main.rs");
+        assert_eq!(diff.diffs.len(), 1);
+        assert_eq!(diff.diffs[0].file_path, "src/main.rs");
+        assert_eq!(diff.diffs[0].search, "fn main() {}");
+        assert_eq!(diff.diffs[0].replace, "fn main() { println!(\"hi\"); }");
+    }
+
+    #[test]
+    fn pi_write_tool_start_is_proxied_to_native_file_creation_action() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+
+        let action = handle_pi_event(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_write",
+                    "toolName": "write",
+                    "args": {
+                    "path": "__warp_pi_local_test_new_file__.txt",
+                    "content": "new contents"
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let PiEventAction::Finish(events) = action else {
+            panic!("expected stream finish for proxied write");
+        };
+
+        let tool_call = event_tool_call(&events[0]).unwrap();
+        let Some(api::message::tool_call::Tool::ApplyFileDiffs(diff)) = tool_call.tool.as_ref()
+        else {
+            panic!("expected ApplyFileDiffs tool call");
+        };
+        assert_eq!(diff.summary, "Write __warp_pi_local_test_new_file__.txt");
+        assert_eq!(diff.new_files.len(), 1);
+        assert_eq!(
+            diff.new_files[0].file_path,
+            "__warp_pi_local_test_new_file__.txt"
+        );
+        assert_eq!(diff.new_files[0].content, "new contents");
+    }
+
+    #[test]
+    fn pi_mcp_tools_are_proxied_to_native_warp_actions() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+
+        let action = handle_pi_event(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_mcp",
+                "toolName": "warp_mcp_call",
+                "args": {
+                    "name": "github_search",
+                    "serverId": "server-1",
+                    "args": { "query": "warp" }
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let PiEventAction::Finish(events) = action else {
+            panic!("expected stream finish for proxied mcp call");
+        };
+
+        let tool_call = event_tool_call(&events[0]).unwrap();
+        let Some(api::message::tool_call::Tool::CallMcpTool(mcp)) = tool_call.tool.as_ref() else {
+            panic!("expected CallMcpTool tool call");
+        };
+        assert_eq!(mcp.name, "github_search");
+        assert_eq!(mcp.server_id, "server-1");
+        let query = mcp
+            .args
+            .as_ref()
+            .and_then(|args| args.fields.get("query"))
+            .and_then(|value| value.kind.as_ref());
+        assert!(matches!(
+            query,
+            Some(prost_types::value::Kind::StringValue(value)) if value == "warp"
+        ));
+
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+        let action = handle_pi_event(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_resource",
+                "toolName": "warp_mcp_read_resource",
+                "args": {
+                    "uri": "mcp://resource",
+                    "serverId": "server-1"
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let PiEventAction::Finish(events) = action else {
+            panic!("expected stream finish for proxied mcp resource");
+        };
+        let tool_call = event_tool_call(&events[0]).unwrap();
+        let Some(api::message::tool_call::Tool::ReadMcpResource(resource)) =
+            tool_call.tool.as_ref()
+        else {
+            panic!("expected ReadMcpResource tool call");
+        };
+        assert_eq!(resource.uri, "mcp://resource");
+        assert_eq!(resource.server_id, "server-1");
+    }
+
+    #[test]
+    fn pi_long_running_command_tools_are_proxied_to_native_warp_actions() {
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+
+        let action = handle_pi_event(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_lrc_write",
+                "toolName": "warp_lrc_write",
+                "args": {
+                    "commandId": "block-1",
+                    "input": "status",
+                    "mode": "line"
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let PiEventAction::Finish(events) = action else {
+            panic!("expected stream finish for proxied lrc write");
+        };
+        let tool_call = event_tool_call(&events[0]).unwrap();
+        let Some(api::message::tool_call::Tool::WriteToLongRunningShellCommand(write)) =
+            tool_call.tool.as_ref()
+        else {
+            panic!("expected WriteToLongRunningShellCommand tool call");
+        };
+        assert_eq!(write.command_id, "block-1");
+        assert_eq!(write.input, b"status");
+        assert!(matches!(
+            write.mode.as_ref().and_then(|mode| mode.mode.as_ref()),
+            Some(
+                api::message::tool_call::write_to_long_running_shell_command::mode::Mode::Line(())
+            )
+        ));
+
+        let mut state = PiStreamState::new("task".to_string(), "request".to_string());
+        let action = handle_pi_event(
+            &json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call_lrc_read",
+                "toolName": "warp_lrc_read",
+                "args": {
+                    "commandId": "block-1",
+                    "waitUntilComplete": true
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let PiEventAction::Finish(events) = action else {
+            panic!("expected stream finish for proxied lrc read");
+        };
+        let tool_call = event_tool_call(&events[0]).unwrap();
+        let Some(api::message::tool_call::Tool::ReadShellCommandOutput(read)) =
+            tool_call.tool.as_ref()
+        else {
+            panic!("expected ReadShellCommandOutput tool call");
+        };
+        assert_eq!(read.command_id, "block-1");
+        assert!(matches!(
+            read.delay.as_ref(),
+            Some(api::message::tool_call::read_shell_command_output::Delay::OnCompletion(()))
+        ));
     }
 
     #[test]

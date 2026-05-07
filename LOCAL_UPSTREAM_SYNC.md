@@ -31,7 +31,10 @@ Current local commits are expected to sit on top of upstream:
    - Adds safe Pi extension UI fallback handling.
 4. `Proxy Pi bash through Warp actions`
    - Converts Pi `bash` tool starts into native Warp `RunShellCommand` actions.
-   - Keeps `edit`/`write` blocked until they have native Warp action bridges.
+   - Converts Pi `edit`/`write` starts into native Warp `ApplyFileDiffs`
+     actions.
+   - Registers Pi extension bridge tools for Warp MCP and long-running command
+     actions.
 
 Treat these commits as the local feature stack. Prefer keeping new local work in
 small commits after these, instead of squashing everything into one large patch.
@@ -103,6 +106,9 @@ Resolve conflicts in this order:
      upstream rather than preserving old adapter assumptions.
 2. Agent action pipeline
    - Preserve native Warp execution for proxied `bash`.
+   - Preserve native Warp diff preview/application for proxied `edit`/`write`.
+   - Preserve native Warp MCP and long-running command actions for
+     `warp_mcp_*` and `warp_lrc_*`.
    - Do not emit display-only `ToolCall` messages for Pi read-only tools,
      because Warp queues tool calls for execution after stream finish.
 3. Auth and OSS startup
@@ -114,8 +120,9 @@ Resolve conflicts in this order:
      upstream layout APIs if they changed.
 5. Pi runtime resources
    - Preserve `app/resources/pi-runtime/warp-tool-gate.ts`.
-   - Keep `bash` allowed only when the Rust action proxy is active.
-   - Keep `edit`/`write` blocked until native action bridges exist.
+   - Keep mutating Pi tools allowed only when the Rust action proxy is active.
+   - Keep raw `edit`/`write`/`bash` execution blocked unless explicitly enabled
+     for local testing.
 
 ## Validation
 
@@ -147,7 +154,8 @@ If upstream changes the agent stream, task, action, or conversation model:
 - Then preserve the behavioral contract:
   - Pi text deltas become Warp agent output messages.
   - Pi read-only tool activity is display-only.
-  - Pi `bash` becomes a native Warp action and ends the stream.
+  - Pi `bash`, `edit`, `write`, MCP bridge, and long-running command bridge
+    tools become native Warp actions and end the stream.
   - Warp `ActionResult` is serialized back to the Pi session.
 - Add or update tests in `pi_local.rs` for any changed contract.
 
@@ -179,7 +187,7 @@ WARP_PI_COMMAND=pi.cmd
 WARP_PI_PROVIDER=openai-codex
 WARP_PI_MODEL=gpt-5.5
 WARP_PI_THINKING=high
-WARP_PI_TOOLS=read,grep,find,ls,bash
+WARP_PI_TOOLS=read,grep,find,ls,bash,edit,write,warp_mcp_call,warp_mcp_read_resource,warp_lrc_write,warp_lrc_read,warp_lrc_transfer
 ```
 
 Use `WARP_PI_DISABLE_ACTION_PROXY=1` together with

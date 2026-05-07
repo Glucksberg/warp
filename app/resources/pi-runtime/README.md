@@ -52,7 +52,7 @@ $env:WARP_PI_PROVIDER = "openai-codex"
 $env:WARP_PI_MODEL = "gpt-5.5"
 $env:WARP_PI_THINKING = "high"
 $env:WARP_PI_SESSION_DIR = "$env:LOCALAPPDATA\Warp\data\pi-agent-sessions"
-$env:WARP_PI_TOOLS = "read,grep,find,ls,bash"
+$env:WARP_PI_TOOLS = "read,grep,find,ls,bash,edit,write,warp_mcp_call,warp_mcp_read_resource,warp_lrc_write,warp_lrc_read,warp_lrc_transfer"
 ```
 
 If `WARP_PI_SESSION_DIR` is unset, Warp stores Pi session files under its
@@ -60,22 +60,28 @@ channel-aware data directory in `pi-agent-sessions`. Each local Warp
 conversation gets a deterministic `pi-local-*.jsonl` session file, so normal
 follow-up prompts in the same conversation resume the same Pi context.
 
-Pi read-only tools are enabled by default so the local agent can inspect the
-workspace without depending on Warp's hosted runtime:
+Pi read-only tools can be selected when you want the local agent to inspect the
+workspace without mutating it:
 
 ```powershell
 $env:WARP_PI_TOOLS = "readonly"
 ```
 
-`readonly` expands to `read,grep,find,ls`. For the closest Warp-like local UX,
-use `read,grep,find,ls,bash`: Pi can inspect files directly, while `bash` tool
-calls are proxied into Warp's native `RunShellCommand` action instead of running
-inside Pi. `all` expands to `read,grep,find,ls,bash,edit,write`, but the bundled
-`warp-tool-gate.ts` extension still blocks `edit`/`write` unless
-`WARP_PI_ALLOW_UNBRIDGED_MUTATING_TOOLS=1` is set. This prevents local Pi from
-editing files outside Warp's action approval pipeline. Set `WARP_PI_TOOLS` to
-`none` to disable Pi tool execution, or set `WARP_PI_DISABLE_TOOL_GATE=1` only
-when intentionally testing raw Pi tool behavior.
+`readonly` expands to `read,grep,find,ls`. By default, Warp enables the
+read-only Pi tools plus Warp-native bridge tools:
+
+- `bash` is proxied into Warp's native `RunShellCommand` action.
+- `edit`/`write` are proxied into Warp's native `ApplyFileDiffs` action so the
+  existing diff preview and accept/reject flow owns writes.
+- `warp_mcp_call` and `warp_mcp_read_resource` are extension tools that proxy
+  MCP requests into Warp's native MCP actions.
+- `warp_lrc_write`, `warp_lrc_read`, and `warp_lrc_transfer` proxy
+  long-running shell command interaction into Warp's native terminal actions.
+
+`warp-native` expands to only the Warp bridge tools, while `all` expands to the
+default tool set. Set `WARP_PI_TOOLS` to `none` to disable Pi tool execution, or
+set `WARP_PI_DISABLE_TOOL_GATE=1` only when intentionally testing raw Pi tool
+behavior.
 
 Set both `WARP_PI_DISABLE_ACTION_PROXY=1` and
 `WARP_PI_ALLOW_UNBRIDGED_MUTATING_TOOLS=1` only if you intentionally want Pi's
@@ -99,17 +105,17 @@ and available skill names/descriptions when Warp provides them.
 
 The adapter mirrors Pi read-only tool lifecycle events into a compact streamed
 "Pi tool activity" message. This exposes which local tools ran without asking
-Warp to execute the same tool call a second time. Pi `bash` starts are converted
-to native Warp `RunShellCommand` tool calls and the stream is finished so Warp
-can show its normal action card, approval flow, execution, and `ActionResult`
-continuation. Native Warp tool-call cards are not emitted for Pi-executed
-read-only tools because Warp treats tool-call messages as actions to queue after
-the stream finishes; emitting them only for display would double-run the tool.
+Warp to execute the same tool call a second time. Pi `bash`, `edit`, `write`,
+MCP bridge, and long-running command bridge starts are converted to native Warp
+tool calls and the stream is finished so Warp can show its normal action card,
+approval flow, execution, and `ActionResult` continuation. Native Warp tool-call
+cards are not emitted for Pi-executed read-only tools because Warp treats
+tool-call messages as actions to queue after the stream finishes; emitting them
+only for display would double-run the tool.
 
 Warp `ActionResult` continuations are converted back into a Pi prompt frame in
-the same `pi-local-*` session. This is the first half of the native action
-bridge: once a future controller layer emits a Warp action and finishes the
-stream, the resulting action output can be fed back to Pi as the next frame.
+the same `pi-local-*` session, so results from native shell, file edit, MCP, and
+long-running command actions are fed back to Pi on the next frame.
 
 Pi extension UI requests are handled in RPC mode. Fire-and-forget requests such
 as notifications/status updates are mirrored into the tool activity stream.
@@ -117,8 +123,7 @@ Blocking dialog requests (`select`, `confirm`, `input`, `editor`) receive a
 safe cancellation response so extensions cannot deadlock the local runtime until
 Warp has a real dialog bridge.
 
-Resumed/forked server conversations, native Warp tool approval/execution for
-Pi `edit`/`write`, and first-class extension dialogs are intentionally left for
-the next controller/action-model integration layer. Until that richer bridge
-exists, `edit`/`write` remain blocked by `warp-tool-gate.ts` unless explicitly
-enabled for raw Pi testing.
+Resumed/forked server conversations, first-class extension dialogs, and raw Pi
+mutating tool execution are intentionally left for later layers. By default,
+mutating Pi tools are allowed only when they are proxied through Warp's native
+action flow.
