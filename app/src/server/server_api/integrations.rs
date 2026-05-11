@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use cynic::{MutationBuilder, QueryBuilder};
 
-use crate::channel::ChannelState;
+use crate::channel::{Channel, ChannelState};
 use crate::features::FeatureFlag;
 #[cfg(test)]
 use mockall::automock;
@@ -279,6 +279,10 @@ impl IntegrationsClient for ServerApi {
     }
 
     async fn get_user_github_info(&self) -> Result<UserGithubInfoResult> {
+        if matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+            return Ok(UserGithubInfoResult::Unknown);
+        }
+
         let variables = UserGithubInfoVariables {
             request_context: get_request_context(),
         };

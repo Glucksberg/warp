@@ -20,6 +20,7 @@ use crate::{
 };
 
 use ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent, CustomEndpoint, CustomEndpointModel};
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 
 use super::execution_profiles::profiles::AIExecutionProfilesModel;
@@ -459,6 +460,79 @@ fn default_computer_use_llms() -> AvailableLLMs {
     }
 }
 
+fn pi_codex_llm_info(model: &str, context_window: u32, reasoning_level: &str) -> LLMInfo {
+    LLMInfo {
+        display_name: format!("{model} ({reasoning_level})"),
+        base_model_name: model.to_owned(),
+        id: format!("pi-openai-codex-{model}-{reasoning_level}").into(),
+        reasoning_level: Some(reasoning_level.to_owned()),
+        usage_metadata: LLMUsageMetadata {
+            request_multiplier: 1,
+            credit_multiplier: None,
+        },
+        description: Some("Pi local".to_owned()),
+        disable_reason: None,
+        vision_supported: model != "gpt-5.3-codex-spark",
+        spec: None,
+        provider: LLMProvider::OpenAI,
+        host_configs: HashMap::from([(
+            LLMModelHost::DirectApi,
+            RoutingHostConfig {
+                enabled: true,
+                model_routing_host: LLMModelHost::DirectApi,
+            },
+        )]),
+        discount_percentage: None,
+        context_window: LLMContextWindow {
+            is_configurable: true,
+            min: 4_096,
+            max: context_window,
+            default_max: context_window,
+        },
+    }
+}
+
+fn pi_codex_available_llms() -> AvailableLLMs {
+    let models = [
+        ("gpt-5.1", 272_000),
+        ("gpt-5.1-codex-max", 272_000),
+        ("gpt-5.1-codex-mini", 272_000),
+        ("gpt-5.2", 272_000),
+        ("gpt-5.2-codex", 272_000),
+        ("gpt-5.3-codex", 272_000),
+        ("gpt-5.3-codex-spark", 128_000),
+        ("gpt-5.4", 272_000),
+        ("gpt-5.4-mini", 272_000),
+        ("gpt-5.5", 272_000),
+    ];
+    let reasoning_levels = ["minimal", "low", "medium", "high", "xhigh"];
+
+    let choices = models
+        .into_iter()
+        .flat_map(|(model, context_window)| {
+            reasoning_levels.into_iter().map(move |reasoning_level| {
+                pi_codex_llm_info(model, context_window, reasoning_level)
+            })
+        })
+        .collect();
+
+    AvailableLLMs {
+        default_id: "pi-openai-codex-gpt-5.5-high".into(),
+        choices,
+        preferred_codex_model_id: Some("pi-openai-codex-gpt-5.5-high".into()),
+    }
+}
+
+fn pi_codex_models_by_feature() -> ModelsByFeature {
+    let available = pi_codex_available_llms();
+    ModelsByFeature {
+        agent_mode: available.clone(),
+        coding: available.clone(),
+        cli_agent: Some(available),
+        computer_use: Some(default_computer_use_llms()),
+    }
+}
+
 impl Default for ModelsByFeature {
     fn default() -> Self {
         Self {
@@ -566,7 +640,12 @@ pub struct LLMPreferences {
 
 impl LLMPreferences {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let models_by_feature = get_cached_models(ctx).unwrap_or_default();
+        let models_by_feature = if matches!(ChannelState::channel(), Channel::Local | Channel::Oss)
+        {
+            pi_codex_models_by_feature()
+        } else {
+            get_cached_models(ctx).unwrap_or_default()
+        };
 
         ctx.subscribe_to_model(&NetworkStatus::handle(ctx), |me, event, ctx| {
             if let NetworkStatusEvent::NetworkStatusChanged {
@@ -1064,6 +1143,10 @@ impl LLMPreferences {
 
     /// Fetches the latest set of models from the server for the currently logged in user, and updates the model.
     pub fn refresh_authed_models(&self, ctx: &mut ModelContext<Self>) {
+        if matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+            return;
+        }
+
         // Don't try to fetch auth'd models if the user is not logged in yet.
         if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
             return;
@@ -1087,6 +1170,10 @@ impl LLMPreferences {
 
     /// No auth required (i.e. to populate the pre-login onboarding picker).
     fn refresh_public_models(&self, ctx: &mut ModelContext<Self>) {
+        if matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+            return;
+        }
+
         let ai_api_client = ServerApiProvider::as_ref(ctx).get_ai_client();
         ctx.spawn(
             async move { ai_api_client.get_free_available_models(None).await },

@@ -5,6 +5,7 @@ use super::OnboardingSlide;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use ui_components::{button, Component as _, Options as _};
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::{appearance::Appearance, theme::color::internal_colors, Icon};
 use warpui::{
@@ -105,15 +106,17 @@ impl View for IntroSlide {
 
         let mut stack = Stack::new();
         stack.add_child(centered);
-        stack.add_positioned_child(
-            login_row,
-            OffsetPositioning::offset_from_parent(
-                vec2f(0., -28.),
-                ParentOffsetBounds::ParentBySize,
-                ParentAnchor::BottomMiddle,
-                ChildAnchor::BottomMiddle,
-            ),
-        );
+        if !matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+            stack.add_positioned_child(
+                login_row,
+                OffsetPositioning::offset_from_parent(
+                    vec2f(0., -28.),
+                    ParentOffsetBounds::ParentBySize,
+                    ParentAnchor::BottomMiddle,
+                    ChildAnchor::BottomMiddle,
+                ),
+            );
+        }
         stack.finish()
     }
 }

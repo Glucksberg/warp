@@ -43,8 +43,8 @@ use privacy_page::{PrivacyPageView, PrivacyPageViewEvent};
 use referrals_page::{ReferralsPageEvent, ReferralsPageView};
 use settings_file_footer::{render_footer, SettingsFooterKind, SettingsFooterMouseStates};
 use settings_page::{
-    MatchData, SettingsPage, SettingsPageEvent, SettingsPageMeta, SettingsPageViewHandle,
-    HEADER_PADDING,
+    render_settings_info_banner, MatchData, SettingsPage, SettingsPageEvent, SettingsPageMeta,
+    SettingsPageViewHandle, HEADER_FONT_SIZE, HEADER_PADDING, PAGE_PADDING,
 };
 use show_blocks_view::{ShowBlocksEvent, ShowBlocksView};
 use std::collections::HashMap;
@@ -261,6 +261,13 @@ pub enum SettingsSection {
     OzCloudAPIKeys,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OssSettingsState {
+    Active,
+    Pending,
+    Hidden,
+}
+
 use crate::util::bindings::custom_tag_to_keystroke;
 use std::fmt::{self, Display};
 
@@ -287,6 +294,76 @@ impl Display for SettingsSection {
 }
 
 impl SettingsSection {
+    pub fn oss_settings_state(&self) -> OssSettingsState {
+        match self {
+            Self::Account
+            | Self::AI
+            | Self::BillingAndUsage
+            | Self::Code
+            | Self::CloudEnvironments
+            | Self::MCPServers
+            | Self::OzCloudAPIKeys
+            | Self::Referrals
+            | Self::SharedBlocks
+            | Self::Teams
+            | Self::WarpDrive => OssSettingsState::Hidden,
+            Self::CodeIndexing | Self::Knowledge => OssSettingsState::Pending,
+            Self::About
+            | Self::AgentProfiles
+            | Self::AgentMCPServers
+            | Self::Appearance
+            | Self::EditorAndCodeReview
+            | Self::Features
+            | Self::Keybindings
+            | Self::Privacy
+            | Self::ThirdPartyCLIAgents
+            | Self::WarpAgent
+            | Self::Warpify => OssSettingsState::Active,
+        }
+    }
+
+    pub fn is_visible_in_oss_settings(&self) -> bool {
+        self.oss_settings_state() != OssSettingsState::Hidden
+    }
+
+    pub fn is_pending_in_oss_settings(&self) -> bool {
+        self.oss_settings_state() == OssSettingsState::Pending
+    }
+
+    pub fn oss_nav_label(&self) -> String {
+        if self.is_pending_in_oss_settings() {
+            format!("{self} (pending)")
+        } else {
+            self.to_string()
+        }
+    }
+
+    fn oss_pending_detail(&self) -> &'static str {
+        match self {
+            Self::CodeIndexing => {
+                "Local code indexing is useful for this fork, but it still needs a local embedding/indexing path that does not depend on Warp-hosted services."
+            }
+            Self::Knowledge => {
+                "Knowledge and rules are useful for this fork, but they still need local storage and Pi prompt-context integration before these controls are active."
+            }
+            _ => "This settings page is pending adaptation for the OSS fork.",
+        }
+    }
+
+    fn normalize_for_oss_settings(self) -> Self {
+        match self {
+            // Legacy callsites still target the original MCP settings page.
+            // Keep those entrypoints on the OSS-visible Agents subpage.
+            Self::MCPServers => Self::AgentMCPServers,
+            section if section.is_visible_in_oss_settings() => section,
+            _ => Self::default_oss_settings_section(),
+        }
+    }
+
+    fn default_oss_settings_section() -> Self {
+        Self::WarpAgent
+    }
+
     /// Returns true if this section is a subpage under any umbrella.
     pub fn is_subpage(&self) -> bool {
         self.is_ai_subpage() || self.is_code_subpage() || self.is_cloud_platform_subpage()
@@ -341,9 +418,25 @@ impl SettingsSection {
         ]
     }
 
+    pub fn oss_ai_subpages() -> Vec<Self> {
+        Self::ai_subpages()
+            .iter()
+            .copied()
+            .filter(Self::is_visible_in_oss_settings)
+            .collect()
+    }
+
     /// The ordered list of Code subpage sections shown under the Code umbrella.
     pub fn code_subpages() -> &'static [Self] {
         &[Self::CodeIndexing, Self::EditorAndCodeReview]
+    }
+
+    pub fn oss_code_subpages() -> Vec<Self> {
+        Self::code_subpages()
+            .iter()
+            .copied()
+            .filter(Self::is_visible_in_oss_settings)
+            .collect()
     }
 
     /// The ordered list of Cloud platform subpage sections.
@@ -1234,34 +1327,18 @@ impl SettingsView {
         // Build sidebar nav items. AI page is presented as an "Agents" umbrella
         // with subpages; the actual AI SettingsPage is hidden from direct sidebar listing.
         let mut nav_items = vec![
-            SettingsNavItem::Page(SettingsSection::Account),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
                 "Agents",
-                SettingsSection::ai_subpages().to_vec(),
+                SettingsSection::oss_ai_subpages(),
             )),
-            SettingsNavItem::Page(SettingsSection::BillingAndUsage),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
                 "Code",
-                vec![
-                    SettingsSection::CodeIndexing,
-                    SettingsSection::EditorAndCodeReview,
-                ],
+                SettingsSection::oss_code_subpages(),
             )),
-            SettingsNavItem::Umbrella(SettingsUmbrella::new(
-                "Cloud platform",
-                vec![
-                    SettingsSection::CloudEnvironments,
-                    SettingsSection::OzCloudAPIKeys,
-                ],
-            )),
-            SettingsNavItem::Page(SettingsSection::Teams),
             SettingsNavItem::Page(SettingsSection::Appearance),
             SettingsNavItem::Page(SettingsSection::Features),
             SettingsNavItem::Page(SettingsSection::Keybindings),
             SettingsNavItem::Page(SettingsSection::Warpify),
-            SettingsNavItem::Page(SettingsSection::Referrals),
-            SettingsNavItem::Page(SettingsSection::SharedBlocks),
-            SettingsNavItem::Page(SettingsSection::WarpDrive),
             SettingsNavItem::Page(SettingsSection::Privacy),
             SettingsNavItem::Page(SettingsSection::About),
         ];
@@ -1272,7 +1349,8 @@ impl SettingsView {
             Some(SettingsSection::Code) => SettingsSection::CodeIndexing,
             Some(section) if section.is_subpage() => section,
             other => other.unwrap_or_default(),
-        };
+        }
+        .normalize_for_oss_settings();
 
         // Auto-expand the umbrella if the initial page is one of its subpages.
         if initial_page.is_subpage() {
@@ -1907,7 +1985,8 @@ impl SettingsView {
             SettingsSection::AI => SettingsSection::WarpAgent,
             SettingsSection::Code => SettingsSection::CodeIndexing,
             other => other,
-        };
+        }
+        .normalize_for_oss_settings();
 
         // For AI subpages, the backing page is the AI page. Check it exists.
         let page_section = section.parent_page_section();
@@ -1999,6 +2078,20 @@ impl SettingsView {
     }
 
     fn should_render_page(&self, settings_page: &SettingsPage, app: &AppContext) -> bool {
+        if !settings_page.section.is_visible_in_oss_settings()
+            && !self.nav_items.iter().any(|item| match item {
+                SettingsNavItem::Page(section) => {
+                    section.parent_page_section() == settings_page.section
+                }
+                SettingsNavItem::Umbrella(umbrella) => umbrella
+                    .subpages
+                    .iter()
+                    .any(|section| section.parent_page_section() == settings_page.section),
+            })
+        {
+            return false;
+        }
+
         match &settings_page.view_handle {
             SettingsPageViewHandle::Main(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::Teams(v) => v.as_ref(app).should_render(app),
@@ -2313,6 +2406,41 @@ impl SettingsView {
         .with_background(internal_colors::fg_overlay_1(appearance.theme()))
         .finish()
     }
+
+    fn render_oss_pending_page(
+        &self,
+        section: SettingsSection,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+
+        Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                .with_child(
+                    Text::new(
+                        section.to_string(),
+                        appearance.ui_font_family(),
+                        HEADER_FONT_SIZE,
+                    )
+                    .with_style(Properties::default().weight(Weight::Bold))
+                    .with_color(theme.active_ui_text_color().into())
+                    .finish(),
+                )
+                .with_child(
+                    Container::new(render_settings_info_banner(
+                        "Pending activation in this OSS fork",
+                        Some(section.oss_pending_detail()),
+                        appearance,
+                    ))
+                    .with_margin_top(HEADER_PADDING)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_uniform_padding(PAGE_PADDING)
+        .finish()
+    }
 }
 
 impl Entity for SettingsView {
@@ -2333,6 +2461,11 @@ impl View for SettingsView {
         let content_page_section = self.current_settings_page.parent_page_section();
         let (page, current_page_handle) = if settings_pages.is_empty() {
             (self.render_search_zero_state(appearance), None)
+        } else if self.current_settings_page.is_pending_in_oss_settings() {
+            (
+                self.render_oss_pending_page(self.current_settings_page, appearance),
+                None,
+            )
         } else {
             match settings_pages
                 .iter()

@@ -30,6 +30,8 @@ use onboarding::{
     AgentOnboardingEvent, AgentOnboardingView, OnboardingIntention, SelectedSettings,
 };
 
+use crate::channel::{Channel, ChannelState};
+use crate::features::FeatureFlag;
 use crate::persistence::ModelEvent;
 use crate::report_if_error;
 use crate::server::cloud_objects::update_manager::UpdateManager;
@@ -76,7 +78,6 @@ use crate::{
     server::server_api::ServerApi,
     workspace::{view::OnboardingTutorial, PaneViewLocator, Workspace, WorkspaceRegistry},
 };
-use crate::{features::FeatureFlag, ChannelState};
 use crate::{send_telemetry_from_app_ctx, GlobalResourceHandles, GlobalResourceHandlesProvider};
 use anyhow::Result;
 use cfg_if::cfg_if;
@@ -1592,6 +1593,10 @@ fn mark_local_onboarding_completed(ctx: &AppContext) {
     );
 }
 
+fn should_use_vendor_login_during_onboarding() -> bool {
+    !matches!(ChannelState::channel(), Channel::Local | Channel::Oss)
+}
+
 /// Whether auth and onboarding have completed and we should render the `Workspace`.
 enum AuthOnboardingState {
     Auth(Box<WorkspaceArgs>),
@@ -1673,36 +1678,40 @@ impl RootView {
             workspace_setting,
         };
 
-        let auth_onboarding_state = if auth_state.is_logged_in() {
+        // Local/OSS builds use an in-memory test user to avoid vendor auth. That user looks
+        // "logged in", so the local onboarding gate must run before the logged-in fast path.
+        let has_completed_local_onboarding = FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
+            && has_completed_local_onboarding(ctx);
+        let should_show_pre_login_onboarding = !cfg!(target_family = "wasm")
+            && FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
+            && FeatureFlag::AgentOnboarding.is_enabled()
+            && !has_completed_local_onboarding;
+
+        let auth_onboarding_state = if should_show_pre_login_onboarding {
+            let workspace_args_box: Box<WorkspaceArgs> = workspace_args.into();
+            let onboarding_view = Self::create_agent_onboarding_view(ctx);
+            onboarding_view.update(ctx, |view, ctx| {
+                view.start_onboarding(ctx);
+            });
+            AuthOnboardingState::Onboarding {
+                onboarding_view,
+                target: AuthOnboardingTarget::Workspace(workspace_args_box),
+            }
+        } else if auth_state.is_logged_in() {
             AuthOnboardingState::Terminal(workspace_args.create_workspace(ctx))
         } else {
             cfg_if! {
                 if #[cfg(target_family = "wasm")] {
                     AuthOnboardingState::WebImport(AuthOnboardingTarget::Workspace(workspace_args.into()))
                 } else {
-                    // When OpenWarpNewSettingsModes is enabled, show onboarding before login for
-                    // users who haven't completed it yet (tracked via a local UserPreferences key).
-                    let has_completed_local_onboarding = FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
-                        && has_completed_local_onboarding(ctx);
-                    let should_show_pre_login_onboarding = FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
-                        && FeatureFlag::AgentOnboarding.is_enabled()
-                        && !has_completed_local_onboarding;
                     if FeatureFlag::ForceLogin.is_enabled() {
                         // ForceLogin is true for Preview
                         AuthOnboardingState::Auth(workspace_args.into())
-                    } else if should_show_pre_login_onboarding {
-                        let workspace_args_box: Box<WorkspaceArgs> = workspace_args.into();
-                        let onboarding_view = Self::create_agent_onboarding_view(ctx);
-                        onboarding_view.update(ctx, |view, ctx| {
-                            view.start_onboarding(ctx);
-                        });
-                        AuthOnboardingState::Onboarding {
-                            onboarding_view,
-                            target: AuthOnboardingTarget::Workspace(workspace_args_box),
-                        }
-                    } else if FeatureFlag::SkipFirebaseAnonymousUser.is_enabled() {
-                        // When SkipFirebaseAnonymousUser is enabled, skip the login screen
-                        // entirely and go directly into the workspace.
+                    } else if FeatureFlag::SkipFirebaseAnonymousUser.is_enabled()
+                        || !should_use_vendor_login_during_onboarding()
+                    {
+                        // Local/OSS builds and SkipFirebaseAnonymousUser builds skip the login
+                        // screen entirely and go directly into the workspace.
                         AuthOnboardingState::Terminal(workspace_args.create_workspace(ctx))
                     } else {
                         AuthOnboardingState::Auth(workspace_args.into())
@@ -2186,7 +2195,8 @@ impl RootView {
                 let ai_enabled = selected_settings.is_ai_enabled();
                 let warp_drive_enabled = selected_settings.is_warp_drive_enabled();
                 // With old onboarding, we ask user to log in before onboarding, so don't do it after onboarding completes.
-                let requires_login = !is_logged_in
+                let requires_login = should_use_vendor_login_during_onboarding()
+                    && !is_logged_in
                     && (ai_enabled || warp_drive_enabled)
                     && FeatureFlag::OpenWarpNewSettingsModes.is_enabled();
 

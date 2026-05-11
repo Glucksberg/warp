@@ -1,6 +1,7 @@
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::AIAgentExchangeId;
 use crate::auth::AuthStateProvider;
+use crate::channel::{Channel, ChannelState};
 use crate::pricing::PricingInfoModel;
 use crate::server::server_api::ai::AIClient;
 use crate::settings::AISettings;
@@ -224,6 +225,10 @@ impl AIRequestUsageModel {
 
     /// Spawns a task to refresh the latest AI request usage and bonus grants, fetching from the server.
     pub fn refresh_request_usage_async(&mut self, ctx: &mut ModelContext<Self>) {
+        if matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+            return;
+        }
+
         if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
             return;
         }

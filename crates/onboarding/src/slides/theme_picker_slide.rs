@@ -6,6 +6,7 @@ use crate::visuals::theme_picker_visual;
 use crate::OnboardingIntention;
 use pathfinder_color::ColorU;
 use ui_components::{button, Component as _, Options as _};
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::{appearance::Appearance, theme::color::internal_colors, theme::WarpTheme};
@@ -597,39 +598,41 @@ impl ThemePickerSlide {
             )
             .finish();
 
-        let tos_line = Flex::row()
-            .with_child(
-                ui_builder
-                    .span("By continuing, you agree to Warp's ")
-                    .with_style(disclaimer_styles)
-                    .build()
-                    .finish(),
-            )
-            .with_child(
-                ui_builder
-                    .link(
-                        "Terms of Service".into(),
-                        Some(TOS_URL.into()),
-                        None,
-                        self.tos_mouse_state.clone(),
-                    )
-                    .soft_wrap(false)
-                    .with_style(link_styles)
-                    .build()
-                    .finish(),
-            )
-            .finish();
+        let mut disclaimers = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_child(privacy_line);
 
-        Container::new(
-            Flex::column()
-                .with_main_axis_size(MainAxisSize::Min)
-                .with_cross_axis_alignment(CrossAxisAlignment::Start)
-                .with_child(privacy_line)
-                .with_child(Container::new(tos_line).with_margin_top(8.).finish())
-                .finish(),
-        )
-        .with_margin_top(24.)
-        .finish()
+        if !matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+            let tos_line = Flex::row()
+                .with_child(
+                    ui_builder
+                        .span("By continuing, you agree to Warp's ")
+                        .with_style(disclaimer_styles)
+                        .build()
+                        .finish(),
+                )
+                .with_child(
+                    ui_builder
+                        .link(
+                            "Terms of Service".into(),
+                            Some(TOS_URL.into()),
+                            None,
+                            self.tos_mouse_state.clone(),
+                        )
+                        .soft_wrap(false)
+                        .with_style(link_styles)
+                        .build()
+                        .finish(),
+                )
+                .finish();
+            disclaimers =
+                disclaimers.with_child(Container::new(tos_line).with_margin_top(8.).finish());
+        }
+
+        Container::new(disclaimers.finish())
+            .with_margin_top(24.)
+            .finish()
     }
 
     fn select_theme(&mut self, index: usize, ctx: &mut ViewContext<Self>) {

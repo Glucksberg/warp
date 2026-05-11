@@ -5,7 +5,7 @@
 use anyhow::Result;
 use warp_core::{
     channel::{Channel, ChannelConfig, ChannelState, OzConfig, WarpServerConfig},
-    AppId,
+    features, AppId,
 };
 
 // Simple wrapper around warp::run() for Warp OSS builds.
@@ -26,6 +26,11 @@ fn main() -> Result<()> {
     if cfg!(debug_assertions) {
         state = state.with_additional_features(warp_core::features::DEBUG_FLAGS);
     }
+    state = state.with_additional_features(&[
+        features::FeatureFlag::AgentOnboarding,
+        features::FeatureFlag::OpenWarpNewSettingsModes,
+        features::FeatureFlag::SkipFirebaseAnonymousUser,
+    ]);
     ChannelState::set(state);
 
     warp::run()

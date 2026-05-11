@@ -12,6 +12,7 @@ use crate::{
     ai::{RequestLimitInfo, RequestUsageInfo},
     ai_assistant::utils::{AssistantTranscriptPart, TranscriptPartSubType},
     auth::AuthStateProvider,
+    channel::{Channel, ChannelState},
     send_telemetry_from_ctx,
     server::{
         server_api::{ai::AIClient, ServerApi},
@@ -136,7 +137,8 @@ impl Requests {
             ai_execution_context: None,
         };
 
-        if cached_request_limit_info.is_none()
+        if !matches!(ChannelState::channel(), Channel::Local | Channel::Oss)
+            && cached_request_limit_info.is_none()
             && AuthStateProvider::as_ref(ctx).get().is_logged_in()
         {
             let ai_client = requests.ai_client.clone();

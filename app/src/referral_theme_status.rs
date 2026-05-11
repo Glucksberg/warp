@@ -6,6 +6,7 @@ use crate::{
     server::server_api::referral::{ReferralInfo, ReferralsClient},
 };
 use serde::{Deserialize, Serialize};
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::user_preferences::GetUserPreferences as _;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
@@ -72,6 +73,10 @@ impl ReferralThemeStatus {
         referrals_client: Arc<dyn ReferralsClient>,
         ctx: &mut ModelContext<Self>,
     ) {
+        if matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+            return;
+        }
+
         if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
             return;
         }

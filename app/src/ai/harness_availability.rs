@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use warp_cli::agent::Harness;
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::features::FeatureFlag;
 use warp_core::user_preferences::GetUserPreferences;
 use warp_managed_secrets::{client::SecretOwner, ManagedSecretManager, ManagedSecretValue};
@@ -253,6 +254,10 @@ impl HarnessAvailabilityModel {
     }
 
     pub fn refresh(&self, ctx: &mut ModelContext<Self>) {
+        if matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+            return;
+        }
+
         // The endpoint queries `user`, which requires auth.
         if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
             return;

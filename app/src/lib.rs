@@ -1481,11 +1481,13 @@ pub(crate) fn initialize_app(
             });
 
             for window_id in ctx.window_ids().collect_vec() {
-                SettingsPaneManager::handle(ctx)
-                    .read(ctx, |model, _| model.settings_view(window_id))
-                    .update(ctx, |settings, ctx| {
+                if let Some(settings_view) = SettingsPaneManager::handle(ctx)
+                    .read(ctx, |model, _| model.maybe_settings_view(window_id))
+                {
+                    settings_view.update(ctx, |settings, ctx| {
                         settings.refresh_preferred_graphics_backend_dropdown(ctx);
-                    })
+                    });
+                }
             }
 
             send_telemetry_from_app_ctx!(event, ctx);

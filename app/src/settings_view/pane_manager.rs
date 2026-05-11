@@ -34,6 +34,12 @@ impl SettingsPaneManager {
             .clone()
     }
 
+    pub fn maybe_settings_view(&self, window_id: WindowId) -> Option<ViewHandle<SettingsView>> {
+        self.panes
+            .get(&window_id)
+            .map(|data| data.settings_view.clone())
+    }
+
     pub fn register_view(&mut self, window_id: WindowId, view: ViewHandle<SettingsView>) {
         if let Some(data) = self.panes.get_mut(&window_id) {
             data.settings_view = view;

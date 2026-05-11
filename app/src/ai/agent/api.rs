@@ -25,7 +25,10 @@ use warp_core::features::FeatureFlag;
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::{
-    ai::{blocklist::SessionContext, llms::LLMId},
+    ai::{
+        blocklist::SessionContext,
+        llms::{LLMId, LLMPreferences, LLMProvider},
+    },
     server::server_api::AIApiError,
 };
 
@@ -105,6 +108,9 @@ pub struct RequestParams {
     pub metadata: Option<RequestMetadata>,
     pub session_context: SessionContext,
     pub model: LLMId,
+    pub model_provider: Option<LLMProvider>,
+    pub model_base_name: Option<String>,
+    pub model_reasoning_level: Option<String>,
     #[allow(unused)]
     pub coding_model: LLMId,
     pub cli_agent_model: LLMId,
@@ -292,6 +298,7 @@ impl RequestParams {
                 .session_type()
                 .as_ref()
                 .is_none_or(|t| matches!(t, crate::terminal::model::session::SessionType::Local));
+        let selected_model_info = LLMPreferences::as_ref(app).get_llm_info(&request_input.model_id);
 
         // Reconcile the persisted override against the active base model's
         // current `LLMContextWindow` instead of trusting whatever was stored
@@ -324,6 +331,9 @@ impl RequestParams {
             metadata,
             session_context,
             model: request_input.model_id.clone(),
+            model_provider: selected_model_info.map(|info| info.provider.clone()),
+            model_base_name: selected_model_info.map(|info| info.base_model_name().to_string()),
+            model_reasoning_level: selected_model_info.and_then(|info| info.reasoning_level()),
             coding_model: request_input.coding_model_id.clone(),
             cli_agent_model: request_input.cli_agent_model_id.clone(),
             computer_use_model: request_input.computer_use_model_id.clone(),

@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use warp_core::report_error;
+use warp_core::{
+    channel::{Channel, ChannelState},
+    report_error,
+};
 use warpui::{Entity, ModelContext, SingletonEntity};
 
 use crate::auth::AuthStateProvider;
@@ -50,6 +53,10 @@ impl UsageHistoryModel {
     /// If some usage has already been loaded, this fetches the same number of entries.
     /// If no usage has been loaded, this fetches PAGE_SIZE entries.
     pub fn refresh_usage_history_async(&mut self, ctx: &mut ModelContext<Self>) {
+        if matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+            return;
+        }
+
         if self.is_loading || !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
             return;
         }
@@ -72,6 +79,10 @@ impl UsageHistoryModel {
 
     /// Fetches the next page of conversation usage entries, appending them to the existing list.
     pub fn load_more_usage_history_async(&mut self, ctx: &mut ModelContext<Self>) {
+        if matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+            return;
+        }
+
         if self.is_loading || !self.has_more_entries {
             return;
         }

@@ -3,18 +3,20 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{anyhow, Context as _};
 use async_process::Command;
 use futures::FutureExt as _;
-use futures_lite::StreamExt as _;
 use futures_lite::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use futures_lite::StreamExt as _;
 use serde_json::Value;
 use uuid::Uuid;
+use warp_core::channel::{Channel, ChannelState};
 use warp_multi_agent_api as api;
 
 use crate::ai::agent::{
     AIAgentAttachment, AIAgentContext, AIAgentInput, AnyFileContent, RunningCommand, UserQueryMode,
 };
+use crate::ai::llms::{LLMId, LLMProvider};
 use crate::server::server_api::AIApiError;
 
 use super::{RequestParams, ResponseStream, ServerConversationToken};
@@ -41,6 +43,10 @@ const PI_TOOL_GATE_EXTENSION_SOURCE: &str =
     include_str!("../../../../resources/pi-runtime/warp-tool-gate.ts");
 
 pub fn is_enabled() -> bool {
+    if matches!(ChannelState::channel(), Channel::Local | Channel::Oss) {
+        return true;
+    }
+
     std::env::var(RUNTIME_ENV)
         .map(|value| value.eq_ignore_ascii_case("pi_local"))
         .unwrap_or_default()
@@ -277,17 +283,11 @@ fn pi_command(params: &RequestParams, conversation_id: &str) -> anyhow::Result<C
         .arg("--session")
         .arg(pi_session_path(conversation_id)?);
 
-    command
-        .arg("--provider")
-        .arg(env_or_default(PI_PROVIDER_ENV, DEFAULT_PI_PROVIDER));
+    command.arg("--provider").arg(pi_provider(params));
 
-    command
-        .arg("--model")
-        .arg(env_or_default(PI_MODEL_ENV, DEFAULT_PI_MODEL));
+    command.arg("--model").arg(pi_model(params));
 
-    command
-        .arg("--thinking")
-        .arg(env_or_default(PI_THINKING_ENV, DEFAULT_PI_THINKING));
+    command.arg("--thinking").arg(pi_thinking(params));
 
     let tools = configure_tools(&mut command);
     if tools.is_enabled() && !env_flag_is_enabled(PI_DISABLE_TOOL_GATE_ENV) {
@@ -404,11 +404,94 @@ fn pi_tool_gate_extension_path() -> anyhow::Result<PathBuf> {
     Ok(extension_path)
 }
 
-fn env_or_default(name: &str, default: &str) -> String {
+fn env_or_else(name: &str, fallback: impl FnOnce() -> String) -> String {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
+        .unwrap_or_else(fallback)
+}
+
+fn pi_provider(params: &RequestParams) -> String {
+    env_or_else(PI_PROVIDER_ENV, || match params.model_provider.as_ref() {
+        Some(LLMProvider::Anthropic) => "anthropic".to_string(),
+        Some(LLMProvider::Google) => "google".to_string(),
+        Some(LLMProvider::OpenAI) | Some(LLMProvider::Unknown) | Some(LLMProvider::Xai) | None => {
+            DEFAULT_PI_PROVIDER.to_string()
+        }
+    })
+}
+
+fn pi_model(params: &RequestParams) -> String {
+    env_or_else(PI_MODEL_ENV, || {
+        params
+            .model_base_name
+            .as_deref()
+            .and_then(normalize_pi_model_name)
+            .or_else(|| normalize_pi_model_id(&params.model))
+            .unwrap_or_else(|| DEFAULT_PI_MODEL.to_string())
+    })
+}
+
+fn pi_thinking(params: &RequestParams) -> String {
+    env_or_else(PI_THINKING_ENV, || {
+        params
+            .model_reasoning_level
+            .as_deref()
+            .and_then(normalize_pi_thinking)
+            .or_else(|| infer_pi_thinking_from_model_id(&params.model))
+            .unwrap_or_else(|| DEFAULT_PI_THINKING.to_string())
+    })
+}
+
+fn normalize_pi_model_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.starts_with("auto") {
+        return None;
+    }
+
+    Some(value.replace(' ', "-").to_lowercase())
+}
+
+fn normalize_pi_model_id(model: &LLMId) -> Option<String> {
+    let id = model.as_str();
+    if id.starts_with("auto") {
+        return None;
+    }
+
+    for suffix in ["-minimal", "-low", "-medium", "-high", "-xhigh"] {
+        if let Some(base) = id.strip_suffix(suffix) {
+            return Some(normalize_pi_model_id_base(base));
+        }
+    }
+
+    Some(normalize_pi_model_id_base(id))
+}
+
+fn normalize_pi_model_id_base(id: &str) -> String {
+    id.replace("gpt-5-5", "gpt-5.5")
+        .replace("gpt-5-4", "gpt-5.4")
+        .replace("gpt-5-3", "gpt-5.3")
+        .replace("gpt-5-2", "gpt-5.2")
+}
+
+fn normalize_pi_thinking(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => Some("off".to_string()),
+        "minimal" => Some("minimal".to_string()),
+        "low" => Some("low".to_string()),
+        "medium" => Some("medium".to_string()),
+        "high" => Some("high".to_string()),
+        "xhigh" | "extra high" | "extra-high" => Some("xhigh".to_string()),
+        _ => None,
+    }
+}
+
+fn infer_pi_thinking_from_model_id(model: &LLMId) -> Option<String> {
+    let id = model.as_str();
+    ["minimal", "low", "medium", "high", "xhigh"]
+        .into_iter()
+        .find(|level| id.ends_with(&format!("-{level}")))
+        .map(str::to_string)
 }
 
 fn env_flag_is_enabled(name: &str) -> bool {
@@ -1825,10 +1908,10 @@ mod tests {
     use warp_core::command::ExitCode;
 
     use super::{
-        PiEventAction, PiStreamState, add_bash_tool_call_event, append_agent_output_event,
-        handle_extension_ui_request, handle_pi_event, is_pi_local_conversation_token,
-        plain_prompt_from_input, prompt_from_input, sanitize_session_file_stem,
-        validate_prompt_input,
+        add_bash_tool_call_event, append_agent_output_event, handle_extension_ui_request,
+        handle_pi_event, is_pi_local_conversation_token, plain_prompt_from_input,
+        prompt_from_input, sanitize_session_file_stem, validate_prompt_input, PiEventAction,
+        PiStreamState,
     };
     use crate::ai::agent::api::ServerConversationToken;
 
@@ -2475,11 +2558,9 @@ mod tests {
                 "confirmed": false,
             }))
         );
-        assert!(
-            event_agent_output_text(&events[0])
-                .unwrap()
-                .contains("extension_ui.confirm")
-        );
+        assert!(event_agent_output_text(&events[0])
+            .unwrap()
+            .contains("extension_ui.confirm"));
     }
 
     #[test]
@@ -2497,11 +2578,9 @@ mod tests {
         .expect("expected extension ui handling");
 
         assert_eq!(response, None);
-        assert!(
-            event_agent_output_text(&events[0])
-                .unwrap()
-                .contains("extension_ui.notify")
-        );
+        assert!(event_agent_output_text(&events[0])
+            .unwrap()
+            .contains("extension_ui.notify"));
     }
 
     #[test]
@@ -2542,11 +2621,9 @@ mod tests {
         let PiEventAction::Continue(text_events) = text_action else {
             panic!("expected text continue action");
         };
-        assert!(
-            event_agent_output_text(&tool_events[0])
-                .unwrap()
-                .contains("failed grep")
-        );
+        assert!(event_agent_output_text(&tool_events[0])
+            .unwrap()
+            .contains("failed grep"));
         assert_eq!(event_agent_output_text(&text_events[0]), Some("hello"));
     }
 
