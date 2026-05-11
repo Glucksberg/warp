@@ -94,7 +94,6 @@ impl Credentials {
             Credentials::Firebase(_) | Credentials::ApiKey { .. } | Credentials::SessionCookie => {
                 false
             }
-            #[cfg(any(test, feature = "integration_tests", feature = "skip_login"))]
             Credentials::Test => false,
         }
     }

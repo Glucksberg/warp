@@ -2129,6 +2129,8 @@ mod tests {
                         command: "echo hi".to_string(),
                         output: "hi".to_string(),
                         exit_code: ExitCode::from(0),
+                        start_ts: None,
+                        completed_ts: None,
                     },
                 ),
             },
