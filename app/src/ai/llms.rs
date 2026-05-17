@@ -2,6 +2,7 @@ use parking_lot::FairMutex;
 use serde::{de, Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    process::Command,
     sync::{Arc, OnceLock},
 };
 use warp_core::ui::icons::Icon;
@@ -460,11 +461,63 @@ fn default_computer_use_llms() -> AvailableLLMs {
     }
 }
 
-fn pi_codex_llm_info(model: &str, context_window: u32, reasoning_level: &str) -> LLMInfo {
+const PI_LLM_ID_PREFIX: &str = "pi:";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PiModelRow {
+    provider: String,
+    model: String,
+    context_window: u32,
+    thinking_supported: bool,
+    vision_supported: bool,
+}
+
+fn pi_provider_display_name(provider: &str) -> &str {
+    match provider {
+        "openai-codex" => "OpenAI Codex",
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic",
+        "google" | "gemini" => "Google",
+        "xai" => "xAI",
+        other => other,
+    }
+}
+
+fn pi_llm_provider(provider: &str) -> LLMProvider {
+    match provider {
+        "openai" | "openai-codex" => LLMProvider::OpenAI,
+        "anthropic" => LLMProvider::Anthropic,
+        "google" | "gemini" => LLMProvider::Google,
+        "xai" => LLMProvider::Xai,
+        _ => LLMProvider::Unknown,
+    }
+}
+
+fn pi_llm_id(provider: &str, model: &str, reasoning_level: &str) -> LLMId {
+    format!("{PI_LLM_ID_PREFIX}{provider}:{model}:{reasoning_level}").into()
+}
+
+pub fn parse_pi_llm_id(id: &LLMId) -> Option<(String, String, Option<String>)> {
+    let id = id.as_str().strip_prefix(PI_LLM_ID_PREFIX)?;
+    let mut parts = id.splitn(3, ':');
+    let provider = parts.next()?.to_string();
+    let model = parts.next()?.to_string();
+    let reasoning_level = parts
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+
+    Some((provider, model, reasoning_level))
+}
+
+fn pi_llm_info(row: &PiModelRow, reasoning_level: &str) -> LLMInfo {
+    let provider_display_name = pi_provider_display_name(&row.provider);
+    let base_model_name = format!("{}/{}", row.provider, row.model);
+
     LLMInfo {
-        display_name: format!("{model} ({reasoning_level})"),
-        base_model_name: model.to_owned(),
-        id: format!("pi-openai-codex-{model}-{reasoning_level}").into(),
+        display_name: format!("{provider_display_name}/{} ({reasoning_level})", row.model),
+        base_model_name,
+        id: pi_llm_id(&row.provider, &row.model, reasoning_level),
         reasoning_level: Some(reasoning_level.to_owned()),
         usage_metadata: LLMUsageMetadata {
             request_multiplier: 1,
@@ -472,9 +525,9 @@ fn pi_codex_llm_info(model: &str, context_window: u32, reasoning_level: &str) ->
         },
         description: Some("Pi local".to_owned()),
         disable_reason: None,
-        vision_supported: model != "gpt-5.3-codex-spark",
+        vision_supported: row.vision_supported,
         spec: None,
-        provider: LLMProvider::OpenAI,
+        provider: pi_llm_provider(&row.provider),
         host_configs: HashMap::from([(
             LLMModelHost::DirectApi,
             RoutingHostConfig {
@@ -486,13 +539,173 @@ fn pi_codex_llm_info(model: &str, context_window: u32, reasoning_level: &str) ->
         context_window: LLMContextWindow {
             is_configurable: true,
             min: 4_096,
-            max: context_window,
-            default_max: context_window,
+            max: row.context_window,
+            default_max: row.context_window,
         },
     }
 }
 
-fn pi_codex_available_llms() -> AvailableLLMs {
+fn parse_pi_context_window(value: &str) -> Option<u32> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let (number, multiplier) = if let Some(value) = value.strip_suffix('K') {
+        (value, 1_000.0)
+    } else if let Some(value) = value.strip_suffix('k') {
+        (value, 1_000.0)
+    } else if let Some(value) = value.strip_suffix('M') {
+        (value, 1_000_000.0)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 1_000_000.0)
+    } else {
+        (value, 1.0)
+    };
+
+    number
+        .parse::<f64>()
+        .ok()
+        .map(|value| (value * multiplier).round() as u32)
+}
+
+fn parse_pi_model_rows(output: &str) -> Vec<PiModelRow> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("provider ") {
+                return None;
+            }
+
+            let columns = line.split_whitespace().collect::<Vec<_>>();
+            if columns.len() < 6 {
+                return None;
+            }
+
+            Some(PiModelRow {
+                provider: columns[0].to_owned(),
+                model: columns[1].to_owned(),
+                context_window: parse_pi_context_window(columns[2]).unwrap_or(128_000),
+                thinking_supported: columns[4].eq_ignore_ascii_case("yes"),
+                vision_supported: columns[5].eq_ignore_ascii_case("yes"),
+            })
+        })
+        .collect()
+}
+
+fn discover_pi_model_rows() -> anyhow::Result<Vec<PiModelRow>> {
+    let executable = std::env::var("WARP_PI_COMMAND").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "pi.cmd".to_string()
+        } else {
+            "pi".to_string()
+        }
+    });
+
+    let output = Command::new(executable)
+        .arg("--list-models")
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to run pi --list-models: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "pi --list-models exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    Ok(parse_pi_model_rows(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn pi_available_llms_from_rows(rows: Vec<PiModelRow>) -> Option<AvailableLLMs> {
+    let reasoning_levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+    let choices = rows
+        .iter()
+        .flat_map(|row| {
+            if row.thinking_supported {
+                reasoning_levels
+                    .into_iter()
+                    .map(move |reasoning_level| pi_llm_info(row, reasoning_level))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![pi_llm_info(row, "off")]
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if choices.is_empty() {
+        return None;
+    }
+
+    let default_id = choices
+        .iter()
+        .find(|info| {
+            parse_pi_llm_id(&info.id).is_some_and(|(provider, model, reasoning)| {
+                provider == "openai-codex"
+                    && model == "gpt-5.5"
+                    && reasoning.as_deref() == Some("high")
+            })
+        })
+        .or_else(|| {
+            choices.iter().find(|info| {
+                parse_pi_llm_id(&info.id)
+                    .is_some_and(|(_, _, reasoning)| reasoning.as_deref() == Some("high"))
+            })
+        })
+        .unwrap_or(&choices[0])
+        .id
+        .clone();
+
+    let preferred_codex_model_id = choices
+        .iter()
+        .find(|info| {
+            parse_pi_llm_id(&info.id).is_some_and(|(provider, model, reasoning)| {
+                provider == "openai-codex"
+                    && model == "gpt-5.5"
+                    && reasoning.as_deref() == Some("high")
+            })
+        })
+        .map(|info| info.id.clone());
+
+    Some(AvailableLLMs {
+        default_id,
+        choices,
+        preferred_codex_model_id,
+    })
+}
+
+fn discover_pi_available_llms() -> Option<AvailableLLMs> {
+    match discover_pi_model_rows().and_then(|rows| {
+        pi_available_llms_from_rows(rows)
+            .ok_or_else(|| anyhow::anyhow!("pi --list-models returned no models"))
+    }) {
+        Ok(available) => Some(available),
+        Err(e) => {
+            log::warn!("Failed to discover Pi local models: {e}");
+            None
+        }
+    }
+}
+
+fn pi_codex_llm_info(model: &str, context_window: u32, reasoning_level: &str) -> LLMInfo {
+    let row = PiModelRow {
+        provider: "openai-codex".to_owned(),
+        model: model.to_owned(),
+        context_window,
+        thinking_supported: true,
+        vision_supported: model != "gpt-5.3-codex-spark",
+    };
+
+    pi_llm_info(&row, reasoning_level)
+}
+
+fn static_pi_codex_available_llms() -> AvailableLLMs {
     let models = [
         ("gpt-5.1", 272_000),
         ("gpt-5.1-codex-max", 272_000),
@@ -505,7 +718,7 @@ fn pi_codex_available_llms() -> AvailableLLMs {
         ("gpt-5.4-mini", 272_000),
         ("gpt-5.5", 272_000),
     ];
-    let reasoning_levels = ["minimal", "low", "medium", "high", "xhigh"];
+    let reasoning_levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
     let choices = models
         .into_iter()
@@ -517,14 +730,18 @@ fn pi_codex_available_llms() -> AvailableLLMs {
         .collect();
 
     AvailableLLMs {
-        default_id: "pi-openai-codex-gpt-5.5-high".into(),
+        default_id: pi_llm_id("openai-codex", "gpt-5.5", "high"),
         choices,
-        preferred_codex_model_id: Some("pi-openai-codex-gpt-5.5-high".into()),
+        preferred_codex_model_id: Some(pi_llm_id("openai-codex", "gpt-5.5", "high")),
     }
 }
 
-fn pi_codex_models_by_feature() -> ModelsByFeature {
-    let available = pi_codex_available_llms();
+fn pi_local_available_llms() -> AvailableLLMs {
+    discover_pi_available_llms().unwrap_or_else(static_pi_codex_available_llms)
+}
+
+fn pi_local_models_by_feature() -> ModelsByFeature {
+    let available = pi_local_available_llms();
     ModelsByFeature {
         agent_mode: available.clone(),
         coding: available.clone(),
@@ -642,7 +859,7 @@ impl LLMPreferences {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
         let models_by_feature = if matches!(ChannelState::channel(), Channel::Local | Channel::Oss)
         {
-            pi_codex_models_by_feature()
+            pi_local_models_by_feature()
         } else {
             get_cached_models(ctx).unwrap_or_default()
         };

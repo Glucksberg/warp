@@ -412,35 +412,46 @@ fn env_or_else(name: &str, fallback: impl FnOnce() -> String) -> String {
 }
 
 fn pi_provider(params: &RequestParams) -> String {
-    env_or_else(PI_PROVIDER_ENV, || match params.model_provider.as_ref() {
-        Some(LLMProvider::Anthropic) => "anthropic".to_string(),
-        Some(LLMProvider::Google) => "google".to_string(),
-        Some(LLMProvider::OpenAI) | Some(LLMProvider::Unknown) | Some(LLMProvider::Xai) | None => {
-            DEFAULT_PI_PROVIDER.to_string()
-        }
+    params.model_pi_provider.clone().unwrap_or_else(|| {
+        env_or_else(PI_PROVIDER_ENV, || match params.model_provider.as_ref() {
+            Some(LLMProvider::Anthropic) => "anthropic".to_string(),
+            Some(LLMProvider::Google) => "google".to_string(),
+            Some(LLMProvider::Xai) => "xai".to_string(),
+            Some(LLMProvider::OpenAI) | Some(LLMProvider::Unknown) | None => {
+                DEFAULT_PI_PROVIDER.to_string()
+            }
+        })
     })
 }
 
 fn pi_model(params: &RequestParams) -> String {
-    env_or_else(PI_MODEL_ENV, || {
-        params
-            .model_base_name
-            .as_deref()
-            .and_then(normalize_pi_model_name)
-            .or_else(|| normalize_pi_model_id(&params.model))
-            .unwrap_or_else(|| DEFAULT_PI_MODEL.to_string())
-    })
+    params
+        .model_pi_model
+        .as_deref()
+        .and_then(normalize_pi_model_name)
+        .unwrap_or_else(|| {
+            env_or_else(PI_MODEL_ENV, || {
+                params
+                    .model_base_name
+                    .as_deref()
+                    .and_then(normalize_pi_model_name)
+                    .or_else(|| normalize_pi_model_id(&params.model))
+                    .unwrap_or_else(|| DEFAULT_PI_MODEL.to_string())
+            })
+        })
 }
 
 fn pi_thinking(params: &RequestParams) -> String {
-    env_or_else(PI_THINKING_ENV, || {
-        params
-            .model_reasoning_level
-            .as_deref()
-            .and_then(normalize_pi_thinking)
-            .or_else(|| infer_pi_thinking_from_model_id(&params.model))
-            .unwrap_or_else(|| DEFAULT_PI_THINKING.to_string())
-    })
+    params
+        .model_reasoning_level
+        .as_deref()
+        .and_then(normalize_pi_thinking)
+        .unwrap_or_else(|| {
+            env_or_else(PI_THINKING_ENV, || {
+                infer_pi_thinking_from_model_id(&params.model)
+                    .unwrap_or_else(|| DEFAULT_PI_THINKING.to_string())
+            })
+        })
 }
 
 fn normalize_pi_model_name(value: &str) -> Option<String> {

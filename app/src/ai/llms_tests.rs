@@ -63,6 +63,53 @@ fn llm_info_deserializes_without_base_model_name() {
 }
 
 #[test]
+fn parses_pi_model_rows_from_list_models_output() {
+    let rows = parse_pi_model_rows(
+        "provider      model                context  max-out  thinking  images\n\
+         openai-codex  gpt-5.5              272K     128K     yes       yes\n\
+         anthropic     claude-sonnet        200K     64K      yes       no\n",
+    );
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].provider, "openai-codex");
+    assert_eq!(rows[0].model, "gpt-5.5");
+    assert_eq!(rows[0].context_window, 272_000);
+    assert!(rows[0].thinking_supported);
+    assert!(rows[0].vision_supported);
+    assert_eq!(rows[1].provider, "anthropic");
+    assert!(!rows[1].vision_supported);
+}
+
+#[test]
+fn builds_pi_model_choices_with_provider_encoded_ids() {
+    let available = pi_available_llms_from_rows(vec![PiModelRow {
+        provider: "openai-codex".to_owned(),
+        model: "gpt-5.5".to_owned(),
+        context_window: 272_000,
+        thinking_supported: true,
+        vision_supported: true,
+    }])
+    .expect("should build choices");
+
+    assert_eq!(
+        available.default_id.as_str(),
+        "pi:openai-codex:gpt-5.5:high"
+    );
+    assert!(available
+        .choices
+        .iter()
+        .any(|info| info.id.as_str() == "pi:openai-codex:gpt-5.5:xhigh"));
+    assert_eq!(
+        parse_pi_llm_id(&available.default_id),
+        Some((
+            "openai-codex".to_owned(),
+            "gpt-5.5".to_owned(),
+            Some("high".to_owned())
+        ))
+    );
+}
+
+#[test]
 fn llm_info_deserializes_host_configs_as_vec() {
     // Wire format from server: host_configs is a Vec
     let raw = r#"{
