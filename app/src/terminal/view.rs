@@ -15418,7 +15418,7 @@ impl TerminalView {
 
         let new_size = size_update.new_size.pane_size_px();
         if new_size.x() == 0. || new_size.y() == 0. {
-            log::info!("Tried to resize with size {new_size:?}. Skipping resize");
+            log::debug!("Tried to resize with size {new_size:?}. Skipping resize");
             return;
         }
 
